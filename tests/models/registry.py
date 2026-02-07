@@ -973,6 +973,12 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         min_transformers_version="4.57",
         is_available_online=False,
     ),
+    "SpeechLMForConditionalGeneration": _HfExamplesInfo(
+        "speechlm-qwen3-8b",
+        max_model_len=4096,
+        trust_remote_code=True,
+        is_available_online=False,
+    ),
     "RForConditionalGeneration": _HfExamplesInfo("YannQi/R-4B", trust_remote_code=True),
     "SkyworkR1VChatModel": _HfExamplesInfo(
         "Skywork/Skywork-R1V-38B", trust_remote_code=True

@@ -238,3 +238,12 @@ ep_kernels_workspace/
 vllm/grpc/vllm_engine_pb2.py
 vllm/grpc/vllm_engine_pb2_grpc.py
 vllm/grpc/vllm_engine_pb2.pyi
+
+scripts/
+speechlm-qwen3-8b/
+test/
+claude_plan.md
+claude_vllm_with_audio_input.md
+claude_vllm.md
+implement_result.md
+implement_status.md
