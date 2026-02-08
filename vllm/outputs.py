@@ -47,6 +47,7 @@ class CompletionOutput:
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
+    audio_output: str | None = None  # SpeechLM: base64 WAV audio
 
     def finished(self) -> bool:
         return self.finish_reason is not None

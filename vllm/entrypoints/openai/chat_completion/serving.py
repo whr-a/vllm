@@ -34,6 +34,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+    OpenAIChatCompletionAudio,
 )
 from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     TokenState,
@@ -85,6 +86,7 @@ from vllm.tokenizers.mistral import (
 from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.tool_parsers.utils import partial_json_loads
+from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
 
@@ -1674,6 +1676,29 @@ class OpenAIServingChat(OpenAIServing):
                     "completion."
                 )
                 message = ChatMessage(role=role, reasoning=reasoning, content=content)
+
+            # SpeechLM: attach decoded audio to the response message
+            if hasattr(output, 'audio_output') and output.audio_output:
+                # Re-decode only text tokens (before <|assistant|>)
+                _ASSISTANT_ID = 6
+                text_ids = []
+                for tid in output.token_ids:
+                    if tid == _ASSISTANT_ID:
+                        break
+                    if 256 <= tid < 152192:  # text range
+                        text_ids.append(tid)
+                if text_ids and tokenizer is not None:
+                    message.content = tokenizer.decode(
+                        text_ids, skip_special_tokens=False)
+                else:
+                    message.content = message.content or ""
+                message.audio = OpenAIChatCompletionAudio(
+                    id=f"audio-{random_uuid()}",
+                    data=output.audio_output,
+                    expires_at=int(time.time()) + 3600,
+                    transcript=message.content or "",
+                )
+
             # In OpenAI's API, when a tool is called, the finish_reason is:
             # "tool_calls" for "auto" or "required" tool calls,
             # and "stop" for named tool calls.

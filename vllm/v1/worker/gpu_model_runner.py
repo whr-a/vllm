@@ -885,6 +885,10 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            # SpeechLM: clean up all per-request state
+            _slm = getattr(self.model, 'runnable', self.model)
+            if hasattr(_slm, 'cleanup_request'):
+                _slm.cleanup_request(req_id)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -3532,6 +3536,25 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            # SpeechLM: sync batch request IDs and per-request config
+            # so the model's _update_text_audio_phase and compute_logits
+            # can map positions to request configs.
+            # Unwrap CUDAGraphWrapper / UBatchWrapper since wrapper
+            # __setattr__ does not delegate to the inner model.
+            _speechlm = getattr(self.model, 'runnable', self.model)
+            if hasattr(_speechlm, '_current_batch_req_ids'):
+                _num = self.input_batch.num_reqs
+                _rids = list(self.input_batch.req_ids[:_num])
+                _speechlm._current_batch_req_ids = _rids
+                # Sync per-request extra_args on first encounter.
+                for _rid in _rids:
+                    if (_rid not in _speechlm._per_req_config
+                            and _rid in self.requests):
+                        _sp = self.requests[_rid].sampling_params
+                        if _sp and _sp.extra_args:
+                            _speechlm._per_req_config[_rid] = (
+                                dict(_sp.extra_args))
+
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -3761,6 +3784,58 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
 
+        # SpeechLM: track stream 0 codec tokens and decode audio on
+        # completion.
+        audio_outputs = None
+        _speechlm_audio = getattr(
+            getattr(self.model, 'runnable', self.model),
+            '_stream0_history', None)
+        if _speechlm_audio is not None:
+            # Resolve actual sampled tokens.  With async scheduling
+            # valid_sampled_token_ids is [] (tokens stay on GPU).
+            # Fall back to reading from the GPU sampler output.
+            _sampled = valid_sampled_token_ids
+            if not _sampled and sampler_output is not None:
+                _gpu = sampler_output.sampled_token_ids
+                if _gpu is not None and _gpu.numel() > 0:
+                    _sampled = _gpu[:, 0].tolist()
+                    _sampled = [[t] for t in _sampled]
+            _slm = getattr(self.model, 'runnable', self.model)
+            cfg = _slm.config
+            n_sampled = len(_sampled)
+            for i, req_id in enumerate(req_ids_output_copy):
+                if i >= n_sampled:
+                    break
+                rc = _slm._per_req_config.get(req_id)
+                if (not rc or rc.get("mode") != "text_audio"
+                        or rc.get("phase") != "audio"):
+                    continue
+                tokens = _sampled[i]
+                if not tokens:
+                    continue
+                token = tokens[-1]
+                if cfg.codec_base_offset <= token < cfg.vocab_size:
+                    _slm._stream0_history.setdefault(
+                        req_id, []).append(token)
+                # Detect completion: eos or length cap
+                should_decode = (token == cfg.eos_token_id)
+                if not should_decode:
+                    req_state = self.requests.get(req_id)
+                    if req_state and req_state.sampling_params:
+                        max_t = req_state.sampling_params.max_tokens
+                        if (max_t
+                                and len(req_state.output_token_ids) >= max_t):
+                            should_decode = True
+                if should_decode:
+                    s0 = _slm._stream0_history.pop(req_id, [])
+                    if s0:
+                        b64 = _slm.encode_audio_to_base64_wav(
+                            req_id, s0)
+                        if b64:
+                            if audio_outputs is None:
+                                audio_outputs = {}
+                            audio_outputs[req_id] = b64
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.model_config.enable_return_routed_experts:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -3781,6 +3856,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                audio_outputs=audio_outputs,
             )
 
         if not self.use_async_scheduling:

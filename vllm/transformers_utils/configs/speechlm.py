@@ -160,6 +160,14 @@ class SpeechLMConfig(PretrainedConfig):
         # Audio placeholder (same as audio_token_id, used for input audio)
         audio_placeholder_token_id=8,
         initializer_range=0.02,
+        # Audio output inference parameters
+        audio_temperature=0.8,
+        audio_topk=20,
+        text_temperature=0.6,
+        text_topk=20,
+        # Xcodec decoder
+        xcodec_hf_model_tag="hf-audio/xcodec-hubert-general",
+        xcodec_sample_rate=16000,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -195,6 +203,12 @@ class SpeechLMConfig(PretrainedConfig):
         self.audio_token_id = audio_token_id
         self.audio_placeholder_token_id = audio_placeholder_token_id
         self.initializer_range = initializer_range
+        self.audio_temperature = audio_temperature
+        self.audio_topk = audio_topk
+        self.text_temperature = text_temperature
+        self.text_topk = text_topk
+        self.xcodec_hf_model_tag = xcodec_hf_model_tag
+        self.xcodec_sample_rate = xcodec_sample_rate
 
     def get_text_config(self, decoder=False):
         return self.text_config

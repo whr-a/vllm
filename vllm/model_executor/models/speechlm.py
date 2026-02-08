@@ -69,6 +69,7 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+_ASSISTANT_TOKEN_ID = 6  # <|assistant|> — injected between text and audio
 _AUDIO_SAMPLING_RATE = 16000
 _NUM_MEL_BINS = 128
 _CHUNK_LENGTH = 30  # seconds
@@ -459,8 +460,30 @@ class SpeechLMForConditionalGeneration(
         )
 
         # --- Internal decode state ---
-        # Stream 1-7 token buffer from previous compute_logits call
-        self._stream_buffer: torch.Tensor | None = None
+        # Stream 1-7 token buffer from previous compute_logits call,
+        # keyed by request ID for correct alignment across batch changes.
+        self._stream_buffer_dict: dict[str, torch.Tensor] = {}
+
+        # --- Per-request state ---
+        # Config per request from SamplingParams.extra_args, keyed by req_id.
+        # Expected keys: mode ("text_only"|"text_audio"),
+        # phase ("text"|"transition"|"audio"), text_temperature,
+        # audio_temperature, audio_topk.
+        # Populated by model runner before each forward.
+        self._per_req_config: dict[str, dict] = {}
+        # Stream 1-7 token history per request (keyed by req_id)
+        self._stream17_history: dict[str, list[torch.Tensor]] = {}
+        # Stream 0 codec token history per request (for server-side decode)
+        self._stream0_history: dict[str, list[int]] = {}
+        # Decoded audio base64 per request (populated when request finishes)
+        self._decoded_audio: dict[str, str] = {}
+        # Current batch request IDs (set by model runner before forward)
+        self._current_batch_req_ids: list[str] = []
+
+        # --- Xcodec decoder (frozen, loaded from HF pretrained) ---
+        self._xcodec_model = None  # lazy-loaded on first audio decode
+        self._xcodec_model_tag: str = config.xcodec_hf_model_tag
+        self._xcodec_sample_rate: int = config.xcodec_sample_rate
 
         # --- Precompute masks ---
         self._build_masks(config)
@@ -477,6 +500,11 @@ class SpeechLMForConditionalGeneration(
         modality_mask[config.text_token_id] = False
         modality_mask[config.audio_token_id] = False
         self.register_buffer("modality_mask", modality_mask)
+
+        # text_only modality mask: only allow <|text|>=7
+        text_only_modality_mask = torch.ones(V, dtype=torch.bool)
+        text_only_modality_mask[config.text_token_id] = False
+        self.register_buffer("text_only_modality_mask", text_only_modality_mask)
 
         # Text mask (stream 0): allow text range [256, 152192) + eos + eot
         text_mask_s0 = torch.ones(V, dtype=torch.bool)
@@ -603,6 +631,30 @@ class SpeechLMForConditionalGeneration(
                 multimodal_embeddings += tuple(audio_embeddings)
         return multimodal_embeddings
 
+    def _update_text_audio_phase(self, input_ids: torch.Tensor):
+        """Track text→transition→audio phase changes for text_audio mode.
+
+        During pure decode steps, ``input_ids`` has exactly one token per
+        request, matching ``_current_batch_req_ids`` 1:1.  During mixed
+        prefill/decode steps (where ``input_ids`` is a flat concatenation
+        of all requests' tokens) the guard returns early — the phase
+        update is deferred to the next pure decode step.
+        """
+        batch_rids = self._current_batch_req_ids
+        if not batch_rids or input_ids.shape[0] != len(batch_rids):
+            return  # prefill or mixed step — skip
+        cfg = self.config
+        for i, req_id in enumerate(batch_rids):
+            rc = self._per_req_config.get(req_id)
+            if rc is None or rc.get("mode") != "text_audio":
+                continue
+            phase = rc.get("phase", "text")
+            token = input_ids[i].item()
+            if phase == "text" and token == cfg.eot_token_id:
+                rc["phase"] = "transition"
+            elif phase == "transition" and token == _ASSISTANT_TOKEN_ID:
+                rc["phase"] = "audio"
+
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
@@ -617,6 +669,9 @@ class SpeechLMForConditionalGeneration(
         During decode (audio mode): embed stream 0 token + buffer streams
         1-7, sum across streams.
         """
+        # Phase tracking for text_audio mode
+        self._update_text_audio_phase(input_ids)
+
         # Standard text token embedding
         inputs_embeds = self._embed_text_input_ids(
             input_ids,
@@ -636,7 +691,7 @@ class SpeechLMForConditionalGeneration(
             )
 
         # Multi-stream embedding for audio decode tokens
-        if self._stream_buffer is not None:
+        if self._stream_buffer_dict:
             _, _, is_audio = self._classify_tokens(input_ids)
             if is_audio.any():
                 inputs_embeds = self._apply_stream_embeddings(
@@ -656,35 +711,42 @@ class SpeechLMForConditionalGeneration(
         For audio-mode positions, the embedding becomes:
             sum(embed_tokens(stream_k_token) for k in 0..7)
         where stream 0 is the current input_ids token and streams 1-7
-        come from the internal buffer.
+        come from the per-request buffer dict.
         """
         audio_indices = is_audio.nonzero(as_tuple=True)[0]
         if len(audio_indices) == 0:
             return inputs_embeds
 
-        buf = self._stream_buffer
         embed_fn = self.language_model.model.embed_tokens
+        batch_rids = self._current_batch_req_ids
 
-        # Get stream 1-7 tokens from buffer
-        buf_size = min(len(audio_indices), buf.shape[0])
-        if buf_size == 0:
+        # Collect buffer vectors for each audio position by request ID
+        buf_rows = []
+        valid_positions = []
+        for pos in audio_indices.tolist():
+            if pos < len(batch_rids):
+                req_id = batch_rids[pos]
+                buf_vec = self._stream_buffer_dict.get(req_id)
+                if buf_vec is not None:
+                    buf_rows.append(buf_vec)
+                    valid_positions.append(pos)
+
+        if not buf_rows:
             return inputs_embeds
 
-        # Build [num_audio, 7] buffer slice for audio positions
-        stream_tokens = buf[:buf_size]  # [buf_size, 7]
-
-        # Embed stream 1-7 tokens
-        stream_embeds = embed_fn(stream_tokens)  # [buf_size, 7, hidden]
+        stream_tokens = torch.stack(buf_rows, dim=0)  # [num_valid, 7]
+        stream_embeds = embed_fn(stream_tokens)  # [num_valid, 7, hidden]
 
         # Zero out padding positions (token == 0)
-        pad_mask = (stream_tokens == 0).unsqueeze(-1)  # [buf_size, 7, 1]
+        pad_mask = (stream_tokens == 0).unsqueeze(-1)  # [num_valid, 7, 1]
         stream_embeds = stream_embeds.masked_fill(pad_mask, 0.0)
 
         # Sum stream 1-7 embeddings and add to inputs_embeds
-        stream_sum = stream_embeds.sum(dim=1)  # [buf_size, hidden]
-        actual_indices = audio_indices[:buf_size]
-        inputs_embeds[actual_indices] = (
-            inputs_embeds[actual_indices] + stream_sum
+        stream_sum = stream_embeds.sum(dim=1)  # [num_valid, hidden]
+        valid_idx = torch.tensor(
+            valid_positions, device=inputs_embeds.device, dtype=torch.long)
+        inputs_embeds[valid_idx] = (
+            inputs_embeds[valid_idx] + stream_sum
         )
 
         return inputs_embeds
@@ -757,11 +819,47 @@ class SpeechLMForConditionalGeneration(
         is_text = ~is_detect & ~is_audio
 
         # 3. Apply modality-specific masks to stream-0 logits
+        #
+        # Matches ESPnet's three-phase inference:
+        #   "text_only"  — force <|text|> in detect, never audio.
+        #   "text_audio" — three phases:
+        #        "text":       force <|text|> in detect.  Text mask
+        #                      allows eos + eot.  eot triggers transition.
+        #                      eos (in stop_token_ids) stops the request.
+        #        "transition": force <|assistant|> output (override all
+        #                      logits).  Matches ESPnet's manual injection
+        #                      of <|assistant|> between segments.
+        #        "audio":      allow <|text|>+<|audio|> in detect; normal
+        #                      audio generation.  eos stops the request.
+        #                      eot is masked (only eos should terminate).
+
         if is_detect.any():
-            idx = is_detect.nonzero(as_tuple=True)[0]
-            stream0_logits[idx] = stream0_logits[idx].masked_fill(
-                self.modality_mask.unsqueeze(0), float("-inf")
-            )
+            detect_idx = is_detect.nonzero(as_tuple=True)[0]
+            force_text_pos = []
+            allow_both_pos = []
+            for pos in detect_idx.tolist():
+                rc = self._get_req_config(pos)
+                mode = rc.get("mode", "text_only")
+                if mode == "text_only":
+                    force_text_pos.append(pos)
+                elif mode == "text_audio":
+                    phase = rc.get("phase", "text")
+                    if phase in ("text", "transition"):
+                        force_text_pos.append(pos)
+                    else:  # audio
+                        allow_both_pos.append(pos)
+            if force_text_pos:
+                idx = torch.tensor(
+                    force_text_pos, device=stream0_logits.device)
+                stream0_logits[idx] = stream0_logits[idx].masked_fill(
+                    self.text_only_modality_mask.unsqueeze(0), float("-inf")
+                )
+            if allow_both_pos:
+                idx = torch.tensor(
+                    allow_both_pos, device=stream0_logits.device)
+                stream0_logits[idx] = stream0_logits[idx].masked_fill(
+                    self.modality_mask.unsqueeze(0), float("-inf")
+                )
 
         if is_text.any():
             idx = is_text.nonzero(as_tuple=True)[0]
@@ -774,14 +872,67 @@ class SpeechLMForConditionalGeneration(
             stream0_logits[idx] = stream0_logits[idx].masked_fill(
                 self._audio_masks[0].unsqueeze(0), float("-inf")
             )
+            # Mask eot in audio mode — only eos should terminate.
+            # ESPnet's generation loop stops on both eos and eot, but
+            # since eot is not in stop_token_ids, we mask it here.
+            stream0_logits[idx, cfg.eot_token_id] = float("-inf")
 
         # 4. For audio-mode requests: sample streams 1-7 and buffer
         if is_audio.any():
             self._sample_and_buffer_streams(
                 hidden_states, is_audio, hidden_states.device
             )
-        else:
-            self._stream_buffer = None
+
+        # 5. Per-request temperature compensation for text-mode positions.
+        #
+        # text_only:  vLLM temp = text_temp  → scale = 1
+        # text_audio text phase:
+        #             vLLM temp = audio_temp → scale = audio_temp/text_temp
+        #             (after vLLM divides by audio_temp, effective = text_temp)
+        # text_audio transition/audio phase: scale = 1 (no compensation)
+        if is_text.any():
+            text_idx = is_text.nonzero(as_tuple=True)[0]
+            cfg_defaults = self.config
+            scales = []
+            for pos in text_idx.tolist():
+                rc = self._get_req_config(pos)
+                mode = rc.get("mode", "text_only")
+                if mode == "text_audio" and rc.get("phase", "text") == "text":
+                    vllm_t = rc.get(
+                        "audio_temperature", cfg_defaults.audio_temperature)
+                    text_t = rc.get(
+                        "text_temperature", cfg_defaults.text_temperature)
+                    if vllm_t > 0 and text_t > 0:
+                        scales.append(vllm_t / text_t)
+                    else:
+                        scales.append(1.0)
+                else:
+                    scales.append(1.0)
+            scale_t = torch.tensor(
+                scales, device=stream0_logits.device,
+                dtype=stream0_logits.dtype,
+            )
+            stream0_logits[text_idx] = (
+                stream0_logits[text_idx] * scale_t.unsqueeze(-1)
+            )
+
+        # 6. Transition phase override: force <|assistant|> output.
+        #
+        # After eot is generated and enters the KV cache, the model
+        # processes eot as input and produces hidden states.  We override
+        # the logits to deterministically output <|assistant|>, matching
+        # ESPnet's manual injection of <|assistant|> between segments.
+        batch_rids = self._current_batch_req_ids
+        if batch_rids:
+            for i, req_id in enumerate(batch_rids):
+                if i >= stream0_logits.shape[0]:
+                    break
+                rc = self._per_req_config.get(req_id, {})
+                if rc.get("mode") == "text_audio":
+                    phase = rc.get("phase", "text")
+                    if phase == "transition":
+                        stream0_logits[i] = float("-inf")
+                        stream0_logits[i, _ASSISTANT_TOKEN_ID] = 0.0
 
         return stream0_logits
 
@@ -798,20 +949,22 @@ class SpeechLMForConditionalGeneration(
           Apply audio_mask[s]
           Top-k sample → token for stream s
 
-        Buffer shape: [N, 7] where N is total batch size.
-        Non-audio positions get zeros (pad).
+        Buffer is stored per-request in _stream_buffer_dict (keyed by
+        request ID) so that batch composition changes between iterations
+        do not cause misalignment.
         """
-        N = hidden_states.shape[0]
         cfg = self.config
+        cfg_defaults = self.config
         lm_head = self.language_model.lm_head
         logits_processor = self.language_model.logits_processor
 
-        # Initialize buffer
-        new_buffer = torch.zeros(N, cfg.num_stream - 1,
-                                 dtype=torch.long, device=device)
-
         audio_idx = is_audio.nonzero(as_tuple=True)[0]
+        num_audio = audio_idx.shape[0]
         audio_hidden = hidden_states[audio_idx]  # [num_audio, hidden]
+
+        # Sample all 7 streams for the audio positions
+        new_buffer = torch.zeros(num_audio, cfg.num_stream - 1,
+                                 dtype=torch.long, device=device)
 
         for s in range(1, cfg.num_stream):
             # Add stream embedding offset
@@ -826,11 +979,24 @@ class SpeechLMForConditionalGeneration(
                 self._audio_masks[s].unsqueeze(0), float("-inf")
             )
 
-            # Top-k sample
-            sampled = self._top_k_sample(s_logits)
-            new_buffer[audio_idx, s - 1] = sampled
+            # Top-k sample with config defaults
+            sampled = self._top_k_sample(
+                s_logits,
+                temperature=cfg_defaults.audio_temperature,
+                top_k=cfg_defaults.audio_topk,
+            )
+            new_buffer[:, s - 1] = sampled
 
-        self._stream_buffer = new_buffer
+        # Store buffer and history per-request
+        batch_rids = self._current_batch_req_ids
+        for j, i in enumerate(audio_idx.tolist()):
+            if i < len(batch_rids):
+                req_id = batch_rids[i]
+                buf_vec = new_buffer[j]
+                self._stream_buffer_dict[req_id] = buf_vec.clone()
+                self._stream17_history.setdefault(req_id, []).append(
+                    buf_vec.clone()
+                )
 
     def _top_k_sample(
         self,
@@ -856,6 +1022,212 @@ class SpeechLMForConditionalGeneration(
         probs = torch.softmax(topk_values, dim=-1)
         sampled_idx = torch.multinomial(probs, num_samples=1).squeeze(-1)
         return topk_indices.gather(-1, sampled_idx.unsqueeze(-1)).squeeze(-1)
+
+    # ------------------------------------------------------------------
+    # Per-request helpers
+    # ------------------------------------------------------------------
+    def _get_req_config(self, position_idx: int) -> dict:
+        """Get per-request config for a batch position.
+
+        Returns the extra_args dict for the request at the given position,
+        or an empty dict if unavailable.
+        """
+        if position_idx < len(self._current_batch_req_ids):
+            req_id = self._current_batch_req_ids[position_idx]
+            return self._per_req_config.get(req_id, {})
+        return {}
+
+    def cleanup_request(self, req_id: str):
+        """Remove all per-request state for a finished request.
+
+        Called by model runner on finished_req_ids, and can also be
+        called explicitly by the serving layer after post-processing.
+        """
+        self._per_req_config.pop(req_id, None)
+        self._stream17_history.pop(req_id, None)
+        self._stream0_history.pop(req_id, None)
+        self._decoded_audio.pop(req_id, None)
+        self._stream_buffer_dict.pop(req_id, None)
+
+    def encode_audio_to_base64_wav(
+        self, req_id: str, stream0_tokens: list[int]
+    ) -> str | None:
+        """Decode stream 0 codec tokens to base64 WAV via xcodec.
+
+        Args:
+            req_id: Request ID (used to retrieve stream 1-7 history)
+            stream0_tokens: List of stream 0 codec token IDs (global IDs)
+
+        Returns:
+            Base64-encoded WAV string, or None on failure
+        """
+        import base64
+        import io
+        import wave
+
+        import numpy as np
+
+        if not stream0_tokens:
+            return None
+
+        try:
+            audio_np, sr = self.decode_audio_from_tokens(
+                req_id, stream0_tokens
+            )
+            if len(audio_np) == 0:
+                return None
+
+            # Convert numpy audio to base64 WAV
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(sr)
+                audio_np = np.clip(audio_np, -1.0, 1.0)
+                audio_int16 = (audio_np * 32767).astype(np.int16)
+                wf.writeframes(audio_int16.tobytes())
+            return base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception:
+            logger.exception(
+                "Failed to decode audio for request %s", req_id
+            )
+            return None
+
+    # ------------------------------------------------------------------
+    # Audio decode pipeline
+    # ------------------------------------------------------------------
+    def _get_xcodec_model(self):
+        """Lazy-load the Xcodec model on first use."""
+        if self._xcodec_model is None:
+            from transformers import XcodecModel
+            self._xcodec_model = XcodecModel.from_pretrained(
+                self._xcodec_model_tag
+            ).eval()
+            # Move to same device as the language model
+            device = next(self.language_model.parameters()).device
+            self._xcodec_model = self._xcodec_model.to(device)
+            logger.info("Loaded Xcodec model from %s", self._xcodec_model_tag)
+        return self._xcodec_model
+
+    def _global_to_codebook(
+        self, full_matrix: torch.Tensor
+    ) -> torch.Tensor:
+        """Convert global token IDs to codebook indices [0, 1023].
+
+        Args:
+            full_matrix: [B, T, 8] tensor of global token IDs
+
+        Returns:
+            [B, T, 8] tensor of codebook indices in range [0, 1023]
+        """
+        cfg = self.config
+        result = full_matrix.clone()
+        for s in range(cfg.num_stream):
+            offset = cfg.codec_base_offset + s * cfg.codec_layer_size + 1
+            result[..., s] = (result[..., s] - offset).clamp(0, 1023)
+        return result
+
+    def _delay_deinterleave(
+        self, codes: torch.Tensor
+    ) -> torch.Tensor:
+        """Remove delay interleaving from multi-stream tokens.
+
+        Args:
+            codes: [B, T, 8] delay-interleaved token tensor
+
+        Returns:
+            [B, T-7, 8] de-interleaved (aligned) tensor
+        """
+        _, T, N = codes.shape
+        T_original = T - N + 1
+        if T_original <= 0:
+            return codes[:, :0, :]  # empty
+
+        new_codes = []
+        for n in range(N):
+            new_codes.append(codes[:, n:n + T_original, n])
+        return torch.stack(new_codes, dim=-1)
+
+    @torch.inference_mode()
+    def _xcodec_decode(
+        self, codebook_indices: torch.Tensor
+    ) -> "np.ndarray":
+        """Decode codebook indices to audio waveform.
+
+        Args:
+            codebook_indices: [B, T, 8] codebook indices in [0, 1023]
+
+        Returns:
+            numpy array of audio samples
+        """
+        import numpy as np
+
+        xcodec = self._get_xcodec_model()
+        # Xcodec expects [B, num_codebooks, T]
+        codes = codebook_indices.permute(0, 2, 1).to(xcodec.device)
+        audio_values = xcodec.decode(codes).audio_values
+        return audio_values.squeeze().cpu().numpy()
+
+    def decode_audio_from_tokens(
+        self,
+        req_id: str,
+        stream0_codec_tokens: list[int],
+    ) -> tuple["np.ndarray", int]:
+        """Decode complete audio from stream 0 tokens + stream 1-7 history.
+
+        Args:
+            req_id: Request ID to retrieve stream 1-7 history
+            stream0_codec_tokens: List of stream 0 codec token IDs
+                (global IDs, already filtered to codec range only)
+
+        Returns:
+            (audio_numpy, sample_rate) tuple
+        """
+        import numpy as np
+
+        # Get stream 1-7 history and remove from dict
+        history = self._stream17_history.pop(req_id, [])
+
+        N = len(stream0_codec_tokens)
+        if N == 0:
+            return np.zeros(0, dtype=np.float32), self._xcodec_sample_rate
+
+        # Build stream 0 column
+        device = next(self.language_model.parameters()).device
+        s0 = torch.tensor(stream0_codec_tokens, dtype=torch.long, device=device)
+
+        # Build streams 1-7 matrix from history
+        # Each history entry is [7] tensor (streams 1-7 for one step)
+        H = len(history)
+
+        if H == 0:
+            # No history — create zero-padded streams 1-7
+            s17 = torch.zeros(N, 7, dtype=torch.long, device=device)
+        else:
+            s17_stack = torch.stack(history, dim=0)  # [H, 7]
+            # Align: truncate or pad to match stream 0 length
+            if H >= N:
+                s17 = s17_stack[:N]
+            else:
+                pad = torch.zeros(N - H, 7, dtype=torch.long, device=device)
+                s17 = torch.cat([s17_stack, pad], dim=0)
+
+        # Concatenate: [N, 8] where col 0 is stream 0, cols 1-7 are streams 1-7
+        full_matrix = torch.cat([s0.unsqueeze(1), s17], dim=1)  # [N, 8]
+        full_matrix = full_matrix.unsqueeze(0)  # [1, N, 8]
+
+        # Convert global IDs to codebook indices
+        codebook = self._global_to_codebook(full_matrix)
+
+        # De-interleave
+        aligned = self._delay_deinterleave(codebook)
+
+        if aligned.shape[1] == 0:
+            return np.zeros(0, dtype=np.float32), self._xcodec_sample_rate
+
+        # Decode to audio
+        audio = self._xcodec_decode(aligned)
+        return audio, self._xcodec_sample_rate
 
     # ------------------------------------------------------------------
     # Weight loading
