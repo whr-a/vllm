@@ -147,6 +147,8 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        # CFG: group_id -> set of req_ids (for binding main + shadow)
+        self._cfg_groups: dict[str, set[str]] = {}
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -352,6 +354,11 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
+            # CFG: shadow is bundled by main, skip independent scheduling
+            if request.cfg_main_id is not None:
+                req_index += 1
+                continue
+
             if (
                 request.num_output_placeholders > 0
                 # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
@@ -465,11 +472,71 @@ class Scheduler(SchedulerInterface):
                             req_index -= 1
                     else:
                         preempted_req = self.running.pop()
+                        # CFG: the popped request may already be
+                        # scheduled (e.g. a bundled shadow). Clean up
+                        # its scheduling state to avoid stale entries
+                        # in the scheduler output and corrupted
+                        # num_computed_tokens via _update_after_schedule.
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(
+                                preempted_req_id, 0)
+                            req_to_new_blocks.pop(
+                                preempted_req_id, None)
+                            scheduled_spec_decode_tokens.pop(
+                                preempted_req_id, None)
+                            preempted_enc = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None)
+                            if preempted_enc:
+                                encoder_compute_budget += sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_enc)
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
+
+                    # CFG: preempt partner via direct pointer
+                    partner_id = (preempted_req.cfg_shadow_id
+                                  or preempted_req.cfg_main_id)
+                    if partner_id:
+                        partner = self.requests.get(partner_id)
+                        if (partner and not partner.is_finished()
+                                and partner.status
+                                == RequestStatus.RUNNING):
+                            if partner in self.running:
+                                self.running.remove(partner)
+                            if partner in scheduled_running_reqs:
+                                scheduled_running_reqs.remove(partner)
+                                token_budget += num_scheduled_tokens.pop(
+                                    partner.request_id, 0)
+                                req_to_new_blocks.pop(
+                                    partner.request_id, None)
+                                scheduled_spec_decode_tokens.pop(
+                                    partner.request_id, None)
+                                partner_enc = (
+                                    scheduled_encoder_inputs.pop(
+                                        partner.request_id, None))
+                                if partner_enc:
+                                    encoder_compute_budget += sum(
+                                        partner.get_num_encoder_embeds(i)
+                                        for i in partner_enc)
+                            self._preempt_request(
+                                partner, scheduled_timestamp)
+                            preempted_reqs.append(partner)
+
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
+                        break
+
+                    # CFG: if partner preemption just preempted the
+                    # current request (e.g. FCFS popped our shadow,
+                    # which then preempted us as the partner), we must
+                    # stop — the request is no longer in self.running
+                    # and its KV/state has been reset.
+                    if (partner_id
+                            and request.status != RequestStatus.RUNNING):
+                        new_blocks = None  # signal "cannot schedule"
                         break
 
             if new_blocks is None:
@@ -482,7 +549,6 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
-            req_index += 1
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -515,6 +581,60 @@ class Scheduler(SchedulerInterface):
                     if self.ec_connector is not None:
                         self.ec_connector.update_state_after_alloc(request, i)
 
+            # ── CFG: bundle shadow after main is scheduled ──
+            if request.cfg_shadow_id:
+                shadow = self.requests.get(request.cfg_shadow_id)
+                if shadow and shadow.status == RequestStatus.RUNNING:
+                    s_new_tokens = (
+                        shadow.num_tokens_with_spec
+                        + shadow.num_output_placeholders
+                        - shadow.num_computed_tokens
+                    )
+                    s_new_tokens = min(s_new_tokens, token_budget)
+
+                    s_blocks = None
+                    if s_new_tokens > 0:
+                        s_blocks = self.kv_cache_manager.allocate_slots(
+                            shadow, s_new_tokens,
+                            num_lookahead_tokens=self.num_lookahead_tokens)
+
+                    if s_blocks is None or s_new_tokens == 0:
+                        # Shadow scheduling failed → rollback main, preempt both
+                        scheduled_running_reqs.remove(request)
+                        token_budget += num_scheduled_tokens.pop(
+                            request.request_id)
+                        req_to_new_blocks.pop(request.request_id, None)
+                        scheduled_spec_decode_tokens.pop(
+                            request.request_id, None)
+                        scheduled_encoder_inputs.pop(
+                            request.request_id, None)
+                        # Preempt both — remove from running first.
+                        # main is at req_index; find shadow's position.
+                        shadow_idx = self.running.index(shadow)
+                        if shadow_idx > req_index:
+                            self.running.pop(shadow_idx)
+                            self.running.pop(req_index)
+                            # shadow was after main; req_index now points
+                            # to the correct next element (no adjustment).
+                        else:
+                            self.running.pop(req_index)
+                            self.running.pop(shadow_idx)
+                            # shadow was before main; shift req_index back.
+                            req_index -= 1
+                        self._preempt_request(request, scheduled_timestamp)
+                        preempted_reqs.append(request)
+                        self._preempt_request(shadow, scheduled_timestamp)
+                        preempted_reqs.append(shadow)
+                        continue
+
+                    # Shadow scheduled successfully
+                    scheduled_running_reqs.append(shadow)
+                    num_scheduled_tokens[shadow.request_id] = s_new_tokens
+                    req_to_new_blocks[shadow.request_id] = s_blocks
+                    token_budget -= s_new_tokens
+
+            req_index += 1
+
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
         if self.lora_config:
@@ -537,6 +657,22 @@ class Scheduler(SchedulerInterface):
 
                 request = self.waiting.peek_request()
                 request_id = request.request_id
+
+                # CFG: shadow is bundled by main, skip independent scheduling
+                if request.cfg_main_id is not None:
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
+                # CFG: main+shadow need 2 running slots
+                if (request.cfg_shadow_id
+                        and len(self.running) + 2
+                        > self.max_num_running_reqs):
+                    # Skip this CFG pair; non-CFG requests behind it
+                    # may only need 1 slot and can still be scheduled.
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -728,6 +864,16 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+
+                    # If this is a preempted request that can't fit back
+                    # into KV cache, skip it instead of blocking the
+                    # entire waiting queue (head-of-line blocking).
+                    # Shorter/newer requests behind it may still fit.
+                    if request.num_preemptions > 0:
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
+
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -779,6 +925,7 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                pre_schedule_status = request.status
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -797,6 +944,97 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+
+                # ── CFG: bundle shadow from waiting into running ──
+                if request.cfg_shadow_id:
+                    shadow = self.requests.get(request.cfg_shadow_id)
+                    if shadow and not shadow.is_finished():
+                        # Get computed blocks for shadow
+                        s_computed_blocks, s_computed_tokens = (
+                            self.kv_cache_manager.get_computed_blocks(
+                                shadow))
+                        s_num_new_tokens = (
+                            shadow.num_tokens - s_computed_tokens)
+                        s_num_new_tokens = min(
+                            s_num_new_tokens, token_budget)
+
+                        s_blocks = None
+                        if s_num_new_tokens > 0:
+                            s_blocks = (
+                                self.kv_cache_manager.allocate_slots(
+                                    shadow, s_num_new_tokens,
+                                    num_new_computed_tokens=s_computed_tokens,
+                                    new_computed_blocks=s_computed_blocks))
+
+                        if s_blocks is None or s_num_new_tokens == 0:
+                            # Shadow alloc failed → rollback main.
+                            # Do NOT use _preempt_request here: it
+                            # forces status=PREEMPTED, but if the
+                            # request was originally WAITING (never
+                            # seen by model_runner), the next schedule
+                            # would put it in scheduled_cached_reqs
+                            # causing a KeyError in model_runner.
+                            self.running.remove(request)
+                            if request in scheduled_new_reqs:
+                                scheduled_new_reqs.remove(request)
+                            if request in scheduled_resumed_reqs:
+                                scheduled_resumed_reqs.remove(request)
+                            token_budget += num_scheduled_tokens.pop(
+                                request.request_id)
+                            req_to_new_blocks.pop(
+                                request.request_id, None)
+                            scheduled_spec_decode_tokens.pop(
+                                request.request_id, None)
+                            rollback_encoder = (
+                                scheduled_encoder_inputs.pop(
+                                    request.request_id, None))
+                            if rollback_encoder:
+                                encoder_compute_budget += sum(
+                                    request.get_num_encoder_embeds(i)
+                                    for i in rollback_encoder)
+                            self.kv_cache_manager.free(request)
+                            self.encoder_cache_manager.free(request)
+                            request.status = pre_schedule_status
+                            request.num_computed_tokens = 0
+                            if request.spec_token_ids:
+                                request.spec_token_ids = []
+                            # Skip this CFG pair; smaller requests
+                            # behind it may still fit.
+                            skipped_waiting_requests.prepend_request(
+                                request)
+                            # Shadow is already in
+                            # skipped_waiting_requests (line 654-655).
+                            continue
+
+                        # Shadow scheduled successfully — remove from
+                        # waiting or skipped queue
+                        shadow_in_waiting = False
+                        try:
+                            self.waiting.remove_request(shadow)
+                            shadow_in_waiting = True
+                        except (ValueError, KeyError):
+                            pass
+                        if not shadow_in_waiting:
+                            try:
+                                skipped_waiting_requests.remove_request(
+                                    shadow)
+                            except (ValueError, KeyError):
+                                pass
+
+                        self.running.append(shadow)
+                        if shadow.status == RequestStatus.WAITING:
+                            scheduled_new_reqs.append(shadow)
+                        elif shadow.status == RequestStatus.PREEMPTED:
+                            scheduled_resumed_reqs.append(shadow)
+                        shadow.status = RequestStatus.RUNNING
+                        shadow.num_computed_tokens = s_computed_tokens
+                        req_to_new_blocks[shadow.request_id] = (
+                            self.kv_cache_manager.get_blocks(
+                                shadow.request_id))
+                        num_scheduled_tokens[
+                            shadow.request_id] = s_num_new_tokens
+                        token_budget -= s_num_new_tokens
+
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
@@ -929,7 +1167,13 @@ class Scheduler(SchedulerInterface):
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
-            request = self.requests[req_id]
+            request = self.requests.get(req_id)
+            if request is None:
+                logger.warning(
+                    "CFG: req %s in num_scheduled_tokens but not in "
+                    "scheduler.requests during _update_after_schedule",
+                    req_id)
+                continue
             request.num_computed_tokens += num_scheduled_token
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
@@ -1297,7 +1541,15 @@ class Scheduler(SchedulerInterface):
                 # In this case, we use is_finished() to check.
                 continue
 
-            req_index = model_runner_output.req_id_to_index[req_id]
+            req_index = model_runner_output.req_id_to_index.get(req_id)
+            if req_index is None:
+                # CFG: model runner skipped this request (not in its
+                # self.requests). Skip here too.
+                logger.warning(
+                    "CFG: req %s in num_scheduled_tokens but not in "
+                    "model_runner req_id_to_index (skipped by runner)",
+                    req_id)
+                continue
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
@@ -1417,12 +1669,36 @@ class Scheduler(SchedulerInterface):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
+        # CFG: auto-stop partner when one request finishes naturally.
+        # Without this, the orphaned partner stays in self.running forever,
+        # consuming a running slot and preventing new requests.
+        cfg_partners_to_stop: list[Request] = []
+        for req in stopped_running_reqs | stopped_preempted_reqs:
+            partner_id = req.cfg_shadow_id or req.cfg_main_id
+            if partner_id:
+                partner = self.requests.get(partner_id)
+                if partner and not partner.is_finished():
+                    cfg_partners_to_stop.append(partner)
+        waiting_partners_to_remove = []
+        for partner in cfg_partners_to_stop:
+            partner.status = RequestStatus.FINISHED_STOPPED
+            self._free_request(partner)
+            # Partner could be in running OR waiting (if preempted).
+            # Must remove from the correct queue.
+            if partner.request_id in {r.request_id for r in self.running}:
+                stopped_running_reqs.add(partner)
+            else:
+                waiting_partners_to_remove.append(partner)
+
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
+        # CFG: remove auto-stopped partners that were in waiting (preempted)
+        if waiting_partners_to_remove:
+            self.waiting.remove_requests(waiting_partners_to_remove)
 
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
@@ -1662,6 +1938,11 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self.waiting.add_request(request)
             self.requests[request.request_id] = request
+            # CFG: register group membership
+            if request.cfg_group_id:
+                self._cfg_groups.setdefault(
+                    request.cfg_group_id, set()
+                ).add(request.request_id)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
@@ -1676,8 +1957,18 @@ class Scheduler(SchedulerInterface):
         assert RequestStatus.is_finished(finished_status)
         if isinstance(request_ids, str):
             request_ids = (request_ids,)
-        else:
-            request_ids = set(request_ids)
+        request_ids = set(request_ids)
+
+        # CFG: expand finish to partner via direct pointers
+        extra_ids: set[str] = set()
+        for rid in request_ids:
+            req = self.requests.get(rid)
+            if req:
+                if req.cfg_shadow_id:
+                    extra_ids.add(req.cfg_shadow_id)
+                if req.cfg_main_id:
+                    extra_ids.add(req.cfg_main_id)
+        request_ids.update(extra_ids)
 
         running_requests_to_remove = set()
         waiting_requests_to_remove = []
@@ -1721,6 +2012,14 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         assert request.is_finished()
+
+        # CFG: clean up group registration
+        if request.cfg_group_id:
+            group = self._cfg_groups.get(request.cfg_group_id)
+            if group:
+                group.discard(request.request_id)
+                if not group:
+                    del self._cfg_groups[request.cfg_group_id]
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)

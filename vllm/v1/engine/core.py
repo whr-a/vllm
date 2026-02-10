@@ -312,7 +312,52 @@ class EngineCore:
                 "Disabling KVTransfer for this request."
             )
 
+        # ===== CFG: auto-create shadow request =====
+        cfg_val = None
+        if (request.sampling_params
+                and request.sampling_params.extra_args):
+            cfg_val = request.sampling_params.extra_args.get('cfg')
+
+        if cfg_val is not None and cfg_val > 1:
+            shadow = self._create_cfg_shadow(request)
+            # Bidirectional binding
+            request.cfg_shadow_id = shadow.request_id
+            shadow.cfg_main_id = request.request_id
+            # Shared cfg_group_id (used by model layer for batch pairing)
+            cfg_gid = f"cfg-{request.request_id}"
+            request.cfg_group_id = cfg_gid
+            shadow.cfg_group_id = cfg_gid
+            # Write into extra_args so model layer can read them
+            request.sampling_params.extra_args['cfg_group_id'] = cfg_gid
+            shadow.sampling_params.extra_args['cfg_group_id'] = cfg_gid
+            # Add shadow to scheduler BEFORE main
+            self.scheduler.add_request(shadow)
+
         self.scheduler.add_request(request)
+
+    def _create_cfg_shadow(self, main: Request) -> Request:
+        """Create a shadow request for CFG from the main request."""
+        from copy import deepcopy
+
+        shadow_extra = dict(main.sampling_params.extra_args)
+        shadow_extra['is_shadow'] = True
+
+        shadow_params = deepcopy(main.sampling_params)
+        shadow_params.extra_args = shadow_extra
+
+        shadow = Request(
+            request_id=f"{main.request_id}-shadow",
+            prompt_token_ids=[0] * len(main.prompt_token_ids),
+            sampling_params=shadow_params,
+            pooling_params=None,
+            eos_token_id=main.eos_token_id,
+            client_index=main.client_index,
+            arrival_time=main.arrival_time,
+            lora_request=main.lora_request,
+            priority=main.priority,
+            block_hasher=self.request_block_hasher,
+        )
+        return shadow
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""

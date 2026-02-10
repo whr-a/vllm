@@ -639,21 +639,59 @@ class SpeechLMForConditionalGeneration(
         prefill/decode steps (where ``input_ids`` is a flat concatenation
         of all requests' tokens) the guard returns early — the phase
         update is deferred to the next pure decode step.
+
+        Shadow requests receive pad tokens and cannot detect phase
+        transitions from their own input.  Instead, their phase is
+        synced from the paired main request via ``cfg_group_id``.
         """
         batch_rids = self._current_batch_req_ids
         if not batch_rids or input_ids.shape[0] != len(batch_rids):
             return  # prefill or mixed step — skip
         cfg = self.config
+
+        # Pass 1: update main (non-shadow) requests' phases from input tokens
+        # Batch GPU→CPU transfer: collect indices needing phase checks,
+        # then do a single indexed read instead of N .item() calls.
+        check_indices: list[int] = []
+        check_rids: list[str] = []
+        check_phases: list[str] = []
         for i, req_id in enumerate(batch_rids):
             rc = self._per_req_config.get(req_id)
             if rc is None or rc.get("mode") != "text_audio":
                 continue
+            if rc.get("is_shadow"):
+                continue
             phase = rc.get("phase", "text")
-            token = input_ids[i].item()
-            if phase == "text" and token == cfg.eot_token_id:
-                rc["phase"] = "transition"
-            elif phase == "transition" and token == _ASSISTANT_TOKEN_ID:
-                rc["phase"] = "audio"
+            if phase in ("text", "transition"):
+                check_indices.append(i)
+                check_rids.append(req_id)
+                check_phases.append(phase)
+        if check_indices:
+            tokens = input_ids[check_indices].tolist()
+            for k, token in enumerate(tokens):
+                if (check_phases[k] == "text"
+                        and token == cfg.eot_token_id):
+                    self._per_req_config[check_rids[k]]["phase"] = \
+                        "transition"
+                elif (check_phases[k] == "transition"
+                      and token == _ASSISTANT_TOKEN_ID):
+                    self._per_req_config[check_rids[k]]["phase"] = \
+                        "audio"
+
+        # Pass 2: sync shadow phase from paired main via cfg_group_id
+        main_phase_by_group: dict[str, str] = {}
+        for req_id in batch_rids:
+            rc = self._per_req_config.get(req_id)
+            if rc and rc.get('cfg_group_id') and not rc.get('is_shadow'):
+                main_phase_by_group[rc['cfg_group_id']] = rc.get(
+                    'phase', 'text')
+
+        for req_id in batch_rids:
+            rc = self._per_req_config.get(req_id)
+            if rc and rc.get('is_shadow'):
+                gid = rc.get('cfg_group_id')
+                if gid and gid in main_phase_by_group:
+                    rc['phase'] = main_phase_by_group[gid]
 
     def embed_input_ids(
         self,
@@ -804,6 +842,62 @@ class SpeechLMForConditionalGeneration(
         if stream0_logits is None:
             return None
 
+        # ===== CFG: identify main/shadow pairs in the batch =====
+        # Pairing uses cfg_group_id (not request IDs, since vLLM assigns
+        # its own IDs internally).  Within each group, the request with
+        # is_shadow=True is the unconditional branch.
+        cfg_pairs: dict[int, tuple[int, float]] = {}  # main_idx -> (shadow_idx, cfg_val)
+        shadow_indices: set[int] = set()
+        batch_rids = self._current_batch_req_ids
+
+        if batch_rids:
+            # Group batch positions by cfg_group_id
+            cfg_group_members: dict[str, dict[str, int]] = {}
+            # cfg_group_id -> {"main": batch_idx, "shadow": batch_idx}
+            for i, req_id in enumerate(batch_rids):
+                if i >= stream0_logits.shape[0]:
+                    break
+                rc = self._per_req_config.get(req_id, {})
+                gid = rc.get('cfg_group_id')
+                if not gid:
+                    continue
+                if rc.get('is_shadow'):
+                    shadow_indices.add(i)
+                    cfg_group_members.setdefault(gid, {})['shadow'] = i
+                else:
+                    cfg_group_members.setdefault(gid, {})['main'] = i
+
+            # Build cfg_pairs for groups where both main and shadow are
+            # present AND main is in audio phase with cfg > 1
+            for gid, members in cfg_group_members.items():
+                main_i = members.get('main')
+                shadow_i = members.get('shadow')
+                if main_i is None or shadow_i is None:
+                    continue
+                main_rid = batch_rids[main_i]
+                rc = self._per_req_config.get(main_rid, {})
+                if (rc.get('phase') == 'audio'
+                        and rc.get('cfg', 1) > 1):
+                    cfg_pairs[main_i] = (shadow_i, float(rc['cfg']))
+
+        # Save raw logits for CFG pairs (before masking/temp) — batched
+        cfg_pair_main_indices: list[int] = []
+        cfg_pair_shadow_indices: list[int] = []
+        cfg_pair_vals: list[float] = []
+        for main_idx, (shadow_idx, cfg_val) in cfg_pairs.items():
+            cfg_pair_main_indices.append(main_idx)
+            cfg_pair_shadow_indices.append(shadow_idx)
+            cfg_pair_vals.append(cfg_val)
+        if cfg_pair_main_indices:
+            cfg_raw_main_batch = stream0_logits[
+                cfg_pair_main_indices].clone()   # [K, V]
+            cfg_raw_shadow_batch = stream0_logits[
+                cfg_pair_shadow_indices].clone()  # [K, V]
+        else:
+            cfg_raw_main_batch = None
+            cfg_raw_shadow_batch = None
+        # ===== CFG identification end =====
+
         # 2. Determine mode per position from argmax of raw logits
         tentative = stream0_logits.argmax(dim=-1)  # [N]
 
@@ -880,7 +974,9 @@ class SpeechLMForConditionalGeneration(
         # 4. For audio-mode requests: sample streams 1-7 and buffer
         if is_audio.any():
             self._sample_and_buffer_streams(
-                hidden_states, is_audio, hidden_states.device
+                hidden_states, is_audio, hidden_states.device,
+                cfg_pairs=cfg_pairs,
+                shadow_indices=shadow_indices,
             )
 
         # 5. Per-request temperature compensation for text-mode positions.
@@ -922,7 +1018,6 @@ class SpeechLMForConditionalGeneration(
         # processes eot as input and produces hidden states.  We override
         # the logits to deterministically output <|assistant|>, matching
         # ESPnet's manual injection of <|assistant|> between segments.
-        batch_rids = self._current_batch_req_ids
         if batch_rids:
             for i, req_id in enumerate(batch_rids):
                 if i >= stream0_logits.shape[0]:
@@ -934,6 +1029,36 @@ class SpeechLMForConditionalGeneration(
                         stream0_logits[i] = float("-inf")
                         stream0_logits[i, _ASSISTANT_TOKEN_ID] = 0.0
 
+        # ===== CFG: merge conditioned + unconditioned logits =====
+        # Applied on raw logits, then re-mask for audio range.
+        # Formula: final = main_raw * cfg + shadow_raw * (1 - cfg)
+        #
+        # IMPORTANT: Skip CFG for detect-mode positions (is_detect).
+        # At the text→audio boundary the model outputs <|audio|> as a
+        # modality token.  _audio_masks[0] does NOT include <|audio|>(8),
+        # so applying CFG+mask here would erase <|audio|> from the output
+        # and KV cache, corrupting all subsequent audio frames.
+        # CFG should only operate on actual codec generation steps.
+        if cfg_raw_main_batch is not None:
+            # Filter out detect positions — they must not get CFG merge
+            non_detect = [k for k, mi in enumerate(cfg_pair_main_indices)
+                          if not is_detect[mi]]
+            if non_detect:
+                nd_main = [cfg_pair_main_indices[k] for k in non_detect]
+                cv = torch.tensor(
+                    [cfg_pair_vals[k] for k in non_detect],
+                    device=stream0_logits.device,
+                    dtype=stream0_logits.dtype,
+                ).unsqueeze(-1)  # [K', 1]
+                combined = (cfg_raw_main_batch[non_detect] * cv
+                            + cfg_raw_shadow_batch[non_detect]
+                            * (1.0 - cv))
+                combined.masked_fill_(
+                    self._audio_masks[0].unsqueeze(0), float("-inf"))
+                combined[:, cfg.eot_token_id] = float("-inf")
+                stream0_logits[nd_main] = combined
+        # ===== CFG merge end =====
+
         return stream0_logits
 
     def _sample_and_buffer_streams(
@@ -941,6 +1066,8 @@ class SpeechLMForConditionalGeneration(
         hidden_states: torch.Tensor,
         is_audio: torch.Tensor,
         device: torch.device,
+        cfg_pairs: dict[int, tuple[int, float]] | None = None,
+        shadow_indices: set[int] | None = None,
     ):
         """Sample streams 1-7 for audio-mode requests and update buffer.
 
@@ -949,30 +1076,78 @@ class SpeechLMForConditionalGeneration(
           Apply audio_mask[s]
           Top-k sample → token for stream s
 
+        When CFG is active, shadow positions are skipped (they don't need
+        their own stream 1-7 history).  For main positions with a paired
+        shadow, the stream logits are merged using the CFG formula before
+        sampling.
+
         Buffer is stored per-request in _stream_buffer_dict (keyed by
         request ID) so that batch composition changes between iterations
         do not cause misalignment.
         """
-        cfg = self.config
+        cfg_pairs = cfg_pairs or {}
+        shadow_indices = shadow_indices or set()
+
+        model_cfg = self.config
         cfg_defaults = self.config
         lm_head = self.language_model.lm_head
         logits_processor = self.language_model.logits_processor
 
         audio_idx = is_audio.nonzero(as_tuple=True)[0]
-        num_audio = audio_idx.shape[0]
-        audio_hidden = hidden_states[audio_idx]  # [num_audio, hidden]
 
-        # Sample all 7 streams for the audio positions
-        new_buffer = torch.zeros(num_audio, cfg.num_stream - 1,
+        # Filter out shadow positions — they don't get their own sampling
+        main_audio_positions = [p for p in audio_idx.tolist()
+                                if p not in shadow_indices]
+        if not main_audio_positions:
+            return
+
+        main_audio_idx = torch.tensor(
+            main_audio_positions, device=device)
+        main_audio_hidden = hidden_states[main_audio_idx]  # [N_main, H]
+        num_main = len(main_audio_positions)
+
+        # Build CFG data for batched shadow logit computation.
+        # Pre-compute once; reused across all 7 stream iterations.
+        cfg_local_indices: list[int] = []
+        shadow_hidden_stack: torch.Tensor | None = None
+        cfg_vals_tensor: torch.Tensor | None = None
+        for j, pos in enumerate(main_audio_positions):
+            if pos in cfg_pairs:
+                shadow_idx, cfg_val = cfg_pairs[pos]
+                cfg_local_indices.append(j)
+        if cfg_local_indices:
+            shadow_hs = [hidden_states[cfg_pairs[main_audio_positions[j]][0]]
+                         for j in cfg_local_indices]
+            shadow_hidden_stack = torch.stack(shadow_hs)  # [K, H]
+            cfg_vals_tensor = torch.tensor(
+                [cfg_pairs[main_audio_positions[j]][1]
+                 for j in cfg_local_indices],
+                device=device,
+                dtype=hidden_states.dtype,
+            ).unsqueeze(-1)  # [K, 1]
+
+        # Sample all 7 streams for main audio positions
+        new_buffer = torch.zeros(num_main, model_cfg.num_stream - 1,
                                  dtype=torch.long, device=device)
 
-        for s in range(1, cfg.num_stream):
+        for s in range(1, model_cfg.num_stream):
             # Add stream embedding offset
-            h_s = audio_hidden + self.stream_emb.weight[s].unsqueeze(0)
+            stream_emb = self.stream_emb.weight[s].unsqueeze(0)
+            h_s = main_audio_hidden + stream_emb
 
-            # Compute logits via logits_processor (handles vocab padding
-            # and TP correctly, same as stream 0)
-            s_logits = logits_processor(lm_head, h_s)
+            if shadow_hidden_stack is not None:
+                # Batch main + shadow in one lm_head call
+                h_s_shadow = shadow_hidden_stack + stream_emb  # [K, H]
+                all_h = torch.cat([h_s, h_s_shadow], dim=0)  # [N+K, H]
+                all_logits = logits_processor(lm_head, all_h)
+                s_logits = all_logits[:num_main]
+                s_logits_shadow = all_logits[num_main:]
+                # Vectorized CFG merge
+                s_logits[cfg_local_indices] = (
+                    s_logits[cfg_local_indices] * cfg_vals_tensor
+                    + s_logits_shadow * (1.0 - cfg_vals_tensor))
+            else:
+                s_logits = logits_processor(lm_head, h_s)
 
             # Apply stream-specific mask
             s_logits = s_logits.masked_fill(
@@ -987,16 +1162,27 @@ class SpeechLMForConditionalGeneration(
             )
             new_buffer[:, s - 1] = sampled
 
-        # Store buffer and history per-request
+        # Store buffer and history per-request (main only)
         batch_rids = self._current_batch_req_ids
-        for j, i in enumerate(audio_idx.tolist()):
-            if i < len(batch_rids):
-                req_id = batch_rids[i]
+        for j, pos in enumerate(main_audio_positions):
+            if pos < len(batch_rids):
+                req_id = batch_rids[pos]
                 buf_vec = new_buffer[j]
                 self._stream_buffer_dict[req_id] = buf_vec.clone()
                 self._stream17_history.setdefault(req_id, []).append(
                     buf_vec.clone()
                 )
+
+        # Copy main's stream 1-7 buffer to paired shadow so that
+        # shadow's embedding in the next step includes all 8 streams,
+        # matching ESPnet's prev_token.tile(2, 1, 1) behavior.
+        for j, pos in enumerate(main_audio_positions):
+            if pos in cfg_pairs and pos < len(batch_rids):
+                shadow_batch_idx, _ = cfg_pairs[pos]
+                if shadow_batch_idx < len(batch_rids):
+                    shadow_rid = batch_rids[shadow_batch_idx]
+                    self._stream_buffer_dict[shadow_rid] = (
+                        new_buffer[j].clone())
 
     def _top_k_sample(
         self,
@@ -1040,8 +1226,8 @@ class SpeechLMForConditionalGeneration(
     def cleanup_request(self, req_id: str):
         """Remove all per-request state for a finished request.
 
-        Called by model runner on finished_req_ids, and can also be
-        called explicitly by the serving layer after post-processing.
+        Called by model runner on finished_req_ids for EACH finished request
+        (including shadows via scheduler finish linkage).
         """
         self._per_req_config.pop(req_id, None)
         self._stream17_history.pop(req_id, None)

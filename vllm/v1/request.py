@@ -75,6 +75,7 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
         reasoning_ended: bool | None = None,
+        cfg_group_id: str | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -90,6 +91,12 @@ class Request:
         if self.structured_output_request is not None:
             self.structured_output_request.reasoning_ended = reasoning_ended
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
+
+        # CFG: group ID for binding main + shadow requests
+        self.cfg_group_id = cfg_group_id
+        # CFG: direct pointers for O(1) partner lookup in scheduler
+        self.cfg_shadow_id: str | None = None  # main → shadow
+        self.cfg_main_id: str | None = None    # shadow → main
 
         self.status = RequestStatus.WAITING
         self.events: list[EngineCoreEvent] = []
@@ -182,6 +189,13 @@ class Request:
         request: EngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
     ) -> "Request":
+        # CFG: extract cfg_group_id from extra_args if present
+        cfg_group_id = None
+        if (request.sampling_params is not None
+                and request.sampling_params.extra_args is not None):
+            cfg_group_id = request.sampling_params.extra_args.get(
+                'cfg_group_id')
+
         return cls(
             request_id=request.request_id,
             client_index=request.client_index,
@@ -199,6 +213,7 @@ class Request:
             block_hasher=block_hasher,
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
+            cfg_group_id=cfg_group_id,
         )
 
     def append_output_token_ids(

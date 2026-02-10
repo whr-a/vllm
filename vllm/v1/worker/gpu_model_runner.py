@@ -997,7 +997,16 @@ class GPUModelRunner(
         valid_sampled_token_count = self._get_valid_sampled_token_count()
 
         for i, req_id in enumerate(req_data.req_ids):
-            req_state = self.requests[req_id]
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                # CFG: partner may have been freed via finished_req_ids
+                # in a prior step while scheduler still had it queued.
+                # Skip without mutating scheduler_output (multiproc safe).
+                logger.warning(
+                    "CFG: skipping cached req %s not found in "
+                    "model_runner.requests (likely freed in prior step)",
+                    req_id)
+                continue
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
@@ -2957,6 +2966,58 @@ class GPUModelRunner(
                 if i not in invalid_req_indices_set
             }
 
+        # ===== CFG: shadow token override =====
+        # Force shadow requests to use the same token as their paired main.
+        # Pairing uses cfg_group_id (vLLM assigns its own request IDs
+        # internally, so we cannot rely on user-supplied ID references).
+        _slm = getattr(self.model, 'runnable', self.model)
+        if hasattr(_slm, '_per_req_config'):
+            # Build cfg_group_id -> {main_idx, shadow_idx} mapping
+            _cfg_group_map: dict[str, dict[str, int]] = {}
+            for _i in range(num_sampled_tokens):
+                _rid = self.input_batch.req_ids[_i]
+                _rc = _slm._per_req_config.get(_rid, {})
+                _gid = _rc.get('cfg_group_id')
+                if not _gid:
+                    continue
+                role = 'shadow' if _rc.get('is_shadow') else 'main'
+                _cfg_group_map.setdefault(_gid, {})[role] = _i
+
+            if not self.use_async_scheduling:
+                # Sync path: override valid_sampled_token_ids list
+                for members in _cfg_group_map.values():
+                    main_idx = members.get('main')
+                    shadow_idx = members.get('shadow')
+                    if main_idx is None or shadow_idx is None:
+                        continue
+                    main_rid = self.input_batch.req_ids[main_idx]
+                    main_rc = _slm._per_req_config.get(main_rid, {})
+                    if main_rc.get('phase', 'text') == 'audio':
+                        # Audio phase: shadow gets main's token
+                        if valid_sampled_token_ids[main_idx]:
+                            valid_sampled_token_ids[shadow_idx] = list(
+                                valid_sampled_token_ids[main_idx])
+                    else:
+                        # Text/transition: shadow gets pad (0) → zero context
+                        valid_sampled_token_ids[shadow_idx] = [0]
+            else:
+                # Async path: override GPU tensor directly
+                for members in _cfg_group_map.values():
+                    main_idx = members.get('main')
+                    shadow_idx = members.get('shadow')
+                    if main_idx is None or shadow_idx is None:
+                        continue
+                    main_rid = self.input_batch.req_ids[main_idx]
+                    main_rc = _slm._per_req_config.get(main_rid, {})
+                    if main_rc.get('phase', 'text') == 'audio':
+                        # Audio phase: shadow gets main's token
+                        sampled_token_ids[shadow_idx] = (
+                            sampled_token_ids[main_idx])
+                    else:
+                        # Text/transition: shadow gets pad (0)
+                        sampled_token_ids[shadow_idx] = 0
+        # ===== CFG override end =====
+
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         # NOTE(woosuk): As an exception, when using PP, the scheduler sends
@@ -3379,7 +3440,7 @@ class GPUModelRunner(
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-            num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            num_tokens_unpadded = int(num_scheduled_tokens_np.sum())
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
@@ -3809,6 +3870,9 @@ class GPUModelRunner(
                 rc = _slm._per_req_config.get(req_id)
                 if (not rc or rc.get("mode") != "text_audio"
                         or rc.get("phase") != "audio"):
+                    continue
+                # CFG: skip shadow requests — only main needs audio tracking
+                if rc.get('is_shadow'):
                     continue
                 tokens = _sampled[i]
                 if not tokens:
