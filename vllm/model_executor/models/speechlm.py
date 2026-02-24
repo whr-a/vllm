@@ -662,7 +662,7 @@ class SpeechLMForConditionalGeneration(
             if rc.get("is_shadow"):
                 continue
             phase = rc.get("phase", "text")
-            if phase in ("text", "transition"):
+            if phase in ("text", "transition", "audio"):
                 check_indices.append(i)
                 check_rids.append(req_id)
                 check_phases.append(phase)
@@ -677,6 +677,12 @@ class SpeechLMForConditionalGeneration(
                       and token == _ASSISTANT_TOKEN_ID):
                     self._per_req_config[check_rids[k]]["phase"] = \
                         "audio"
+                elif (check_phases[k] == "audio"
+                      and token == cfg.eot_token_id):
+                    # EOT during audio → force EOS on next step so
+                    # vLLM's stop mechanism finishes the request.
+                    self._per_req_config[check_rids[k]]["phase"] = \
+                        "audio_stop"
 
         # Pass 2: sync shadow phase from paired main via cfg_group_id
         main_phase_by_group: dict[str, str] = {}
@@ -924,8 +930,7 @@ class SpeechLMForConditionalGeneration(
         #                      logits).  Matches ESPnet's manual injection
         #                      of <|assistant|> between segments.
         #        "audio":      allow <|text|>+<|audio|> in detect; normal
-        #                      audio generation.  eos stops the request.
-        #                      eot is masked (only eos should terminate).
+        #                      audio generation.  eos/eot can terminate.
 
         if is_detect.any():
             detect_idx = is_detect.nonzero(as_tuple=True)[0]
@@ -966,10 +971,6 @@ class SpeechLMForConditionalGeneration(
             stream0_logits[idx] = stream0_logits[idx].masked_fill(
                 self._audio_masks[0].unsqueeze(0), float("-inf")
             )
-            # Mask eot in audio mode — only eos should terminate.
-            # ESPnet's generation loop stops on both eos and eot, but
-            # since eot is not in stop_token_ids, we mask it here.
-            stream0_logits[idx, cfg.eot_token_id] = float("-inf")
 
         # 4. For audio-mode requests: sample streams 1-7 and buffer
         if is_audio.any():
@@ -1012,23 +1013,6 @@ class SpeechLMForConditionalGeneration(
                 stream0_logits[text_idx] * scale_t.unsqueeze(-1)
             )
 
-        # 6. Transition phase override: force <|assistant|> output.
-        #
-        # After eot is generated and enters the KV cache, the model
-        # processes eot as input and produces hidden states.  We override
-        # the logits to deterministically output <|assistant|>, matching
-        # ESPnet's manual injection of <|assistant|> between segments.
-        if batch_rids:
-            for i, req_id in enumerate(batch_rids):
-                if i >= stream0_logits.shape[0]:
-                    break
-                rc = self._per_req_config.get(req_id, {})
-                if rc.get("mode") == "text_audio":
-                    phase = rc.get("phase", "text")
-                    if phase == "transition":
-                        stream0_logits[i] = float("-inf")
-                        stream0_logits[i, _ASSISTANT_TOKEN_ID] = 0.0
-
         # ===== CFG: merge conditioned + unconditioned logits =====
         # Applied on raw logits, then re-mask for audio range.
         # Formula: final = main_raw * cfg + shadow_raw * (1 - cfg)
@@ -1055,9 +1039,33 @@ class SpeechLMForConditionalGeneration(
                             * (1.0 - cv))
                 combined.masked_fill_(
                     self._audio_masks[0].unsqueeze(0), float("-inf"))
-                combined[:, cfg.eot_token_id] = float("-inf")
                 stream0_logits[nd_main] = combined
         # ===== CFG merge end =====
+
+        # 6. Transition / audio_stop phase overrides.
+        #
+        # MUST come AFTER CFG merge — otherwise the CFG merge overwrites
+        # the forced logits, and the deterministic output never happens.
+        # This caused requests in audio_stop phase to never generate EOS
+        # when CFG was active, leading to permanent HTTP handler hangs.
+        if batch_rids:
+            for i, req_id in enumerate(batch_rids):
+                if i >= stream0_logits.shape[0]:
+                    break
+                rc = self._per_req_config.get(req_id, {})
+                if rc.get("mode") == "text_audio":
+                    phase = rc.get("phase", "text")
+                    if phase == "transition":
+                        # Force <|assistant|> output after eot enters KV
+                        # cache, matching ESPnet's manual injection.
+                        stream0_logits[i] = float("-inf")
+                        stream0_logits[i, _ASSISTANT_TOKEN_ID] = 0.0
+                    elif phase == "audio_stop":
+                        # EOT was generated during audio; force EOS so
+                        # vLLM stops the request and audio is decoded
+                        # in the same step as finish_reason.
+                        stream0_logits[i] = float("-inf")
+                        stream0_logits[i, cfg.eos_token_id] = 0.0
 
         return stream0_logits
 
@@ -1089,7 +1097,6 @@ class SpeechLMForConditionalGeneration(
         shadow_indices = shadow_indices or set()
 
         model_cfg = self.config
-        cfg_defaults = self.config
         lm_head = self.language_model.lm_head
         logits_processor = self.language_model.logits_processor
 
@@ -1129,6 +1136,9 @@ class SpeechLMForConditionalGeneration(
         # Sample all 7 streams for main audio positions
         new_buffer = torch.zeros(num_main, model_cfg.num_stream - 1,
                                  dtype=torch.long, device=device)
+        sampling_groups = self._get_audio_sampling_groups(
+            main_audio_positions, device
+        )
 
         for s in range(1, model_cfg.num_stream):
             # Add stream embedding offset
@@ -1154,12 +1164,14 @@ class SpeechLMForConditionalGeneration(
                 self._audio_masks[s].unsqueeze(0), float("-inf")
             )
 
-            # Top-k sample with config defaults
-            sampled = self._top_k_sample(
-                s_logits,
-                temperature=cfg_defaults.audio_temperature,
-                top_k=cfg_defaults.audio_topk,
-            )
+            # Top-k sample with per-request params (fallback to defaults).
+            sampled = torch.empty(num_main, dtype=torch.long, device=device)
+            for temperature, top_k, row_indices in sampling_groups:
+                sampled[row_indices] = self._top_k_sample(
+                    s_logits[row_indices],
+                    temperature=temperature,
+                    top_k=top_k,
+                )
             new_buffer[:, s - 1] = sampled
 
         # Store buffer and history per-request (main only)
@@ -1183,6 +1195,69 @@ class SpeechLMForConditionalGeneration(
                     shadow_rid = batch_rids[shadow_batch_idx]
                     self._stream_buffer_dict[shadow_rid] = (
                         new_buffer[j].clone())
+
+    def _get_audio_sampling_groups(
+        self,
+        positions: Sequence[int],
+        device: torch.device,
+    ) -> list[tuple[float, int, torch.Tensor]]:
+        """Group request rows by (audio_temperature, audio_topk)."""
+        cfg = self.config
+        default_temperature = self._normalize_audio_temperature(
+            cfg.audio_temperature,
+            fallback=1.0,
+        )
+        default_top_k = self._normalize_audio_top_k(
+            cfg.audio_topk,
+            fallback=cfg.vocab_size,
+            vocab_size=cfg.vocab_size,
+        )
+
+        grouped_rows: dict[tuple[float, int], list[int]] = {}
+        for row_idx, position_idx in enumerate(positions):
+            req_cfg = self._get_req_config(position_idx)
+            temperature = self._normalize_audio_temperature(
+                req_cfg.get("audio_temperature", default_temperature),
+                fallback=default_temperature,
+            )
+            top_k = self._normalize_audio_top_k(
+                req_cfg.get("audio_topk", default_top_k),
+                fallback=default_top_k,
+                vocab_size=cfg.vocab_size,
+            )
+            grouped_rows.setdefault((temperature, top_k), []).append(row_idx)
+
+        return [
+            (
+                temperature,
+                top_k,
+                torch.tensor(rows, device=device, dtype=torch.long),
+            )
+            for (temperature, top_k), rows in grouped_rows.items()
+        ]
+
+    @staticmethod
+    def _normalize_audio_temperature(value: Any, fallback: float) -> float:
+        try:
+            temperature = float(value)
+        except (TypeError, ValueError):
+            temperature = fallback
+
+        if temperature < 0:
+            return fallback
+        return temperature
+
+    @staticmethod
+    def _normalize_audio_top_k(value: Any, fallback: int, vocab_size: int) -> int:
+        try:
+            top_k = int(value)
+        except (TypeError, ValueError):
+            top_k = fallback
+
+        if top_k <= 0:
+            top_k = vocab_size
+
+        return max(1, min(top_k, vocab_size))
 
     def _top_k_sample(
         self,

@@ -1098,7 +1098,29 @@ class EngineCoreProc(EngineCore):
 
         if request_type == EngineCoreRequestType.ADD:
             req, request_wave = request
-            self.add_request(req, request_wave)
+            try:
+                self.add_request(req, request_wave)
+            except Exception:
+                # Send error output instead of crashing the engine core.
+                # Without this, an exception (e.g., during CFG shadow
+                # creation) kills the entire engine process.
+                logger.exception(
+                    "Failed to add request %s", req.request_id)
+                self.output_queue.put_nowait(
+                    (
+                        req.client_index,
+                        EngineCoreOutputs(
+                            finished_requests={req.request_id},
+                            outputs=[
+                                EngineCoreOutput(
+                                    request_id=req.request_id,
+                                    new_token_ids=[],
+                                    finish_reason=FinishReason.ERROR,
+                                )
+                            ],
+                        ),
+                    )
+                )
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:

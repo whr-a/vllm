@@ -2927,6 +2927,7 @@ class GPUModelRunner(
         sampled_token_ids = sampler_output.sampled_token_ids
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
+        invalid_req_indices_set: set[int] = set()
         logprobs_lists = None
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
@@ -2992,8 +2993,8 @@ class GPUModelRunner(
                         continue
                     main_rid = self.input_batch.req_ids[main_idx]
                     main_rc = _slm._per_req_config.get(main_rid, {})
-                    if main_rc.get('phase', 'text') == 'audio':
-                        # Audio phase: shadow gets main's token
+                    if main_rc.get('phase', 'text') in ('audio', 'audio_stop'):
+                        # Audio/audio_stop phase: shadow gets main's token
                         if valid_sampled_token_ids[main_idx]:
                             valid_sampled_token_ids[shadow_idx] = list(
                                 valid_sampled_token_ids[main_idx])
@@ -3009,8 +3010,8 @@ class GPUModelRunner(
                         continue
                     main_rid = self.input_batch.req_ids[main_idx]
                     main_rc = _slm._per_req_config.get(main_rid, {})
-                    if main_rc.get('phase', 'text') == 'audio':
-                        # Audio phase: shadow gets main's token
+                    if main_rc.get('phase', 'text') in ('audio', 'audio_stop'):
+                        # Audio/audio_stop phase: shadow gets main's token
                         sampled_token_ids[shadow_idx] = (
                             sampled_token_ids[main_idx])
                     else:
@@ -3050,6 +3051,54 @@ class GPUModelRunner(
             req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
+
+            # SpeechLM: advance text_audio phase using sampled tokens.
+            # speechlm.py _update_text_audio_phase handles pure decode
+            # steps, but SKIPS mixed prefill/decode steps (input_ids
+            # shape != batch size).  This tracker ensures phase
+            # transitions are never missed during mixed steps.
+            if hasattr(_slm, "_per_req_config"):
+                rc = _slm._per_req_config.get(req_id)
+                if (rc is not None
+                        and rc.get("mode") == "text_audio"
+                        and not rc.get("is_shadow", False)):
+                    sampled_token: int | None = None
+                    if self.use_async_scheduling:
+                        if req_idx not in invalid_req_indices_set:
+                            sampled_token = int(
+                                sampled_token_ids[req_idx, 0].item())
+                    else:
+                        sampled_token = sampled_ids[-1]
+
+                    if sampled_token is not None:
+                        phase = rc.get("phase", "text")
+                        if (phase == "text"
+                                and sampled_token
+                                == _slm.config.eot_token_id):
+                            rc["phase"] = "transition"
+                        elif phase == "transition":
+                            rc["phase"] = "audio"
+                        elif (phase == "audio"
+                              and sampled_token
+                              == _slm.config.eot_token_id):
+                            # EOT during audio → force EOS on next
+                            # step via audio_stop phase.
+                            rc["phase"] = "audio_stop"
+
+        # SpeechLM: sync shadow phase from paired main (mirrors Pass 2
+        # of _update_text_audio_phase, but runs every step including mixed).
+        if hasattr(_slm, '_per_req_config'):
+            _main_phase_by_group: dict[str, str] = {}
+            for _rid, _rc in _slm._per_req_config.items():
+                if (_rc.get('cfg_group_id')
+                        and not _rc.get('is_shadow')):
+                    _main_phase_by_group[_rc['cfg_group_id']] = (
+                        _rc.get('phase', 'text'))
+            for _rid, _rc in _slm._per_req_config.items():
+                if _rc.get('is_shadow'):
+                    _gid = _rc.get('cfg_group_id')
+                    if _gid and _gid in _main_phase_by_group:
+                        _rc['phase'] = _main_phase_by_group[_gid]
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -3869,7 +3918,7 @@ class GPUModelRunner(
                     break
                 rc = _slm._per_req_config.get(req_id)
                 if (not rc or rc.get("mode") != "text_audio"
-                        or rc.get("phase") != "audio"):
+                        or rc.get("phase") not in ("audio", "audio_stop")):
                     continue
                 # CFG: skip shadow requests — only main needs audio tracking
                 if rc.get('is_shadow'):
@@ -3881,7 +3930,10 @@ class GPUModelRunner(
                 if cfg.codec_base_offset <= token < cfg.vocab_size:
                     _slm._stream0_history.setdefault(
                         req_id, []).append(token)
-                # Detect completion: eos or length cap
+                # Detect completion: eos or length cap.
+                # EOT during audio is handled by the model forcing EOS
+                # on the next step (audio_stop phase), so we only need
+                # to check for EOS here.
                 should_decode = (token == cfg.eos_token_id)
                 if not should_decode:
                     req_state = self.requests.get(req_id)

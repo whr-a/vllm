@@ -384,6 +384,15 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
 
+            # CFG: reserve half the token budget for the shadow so both
+            # main and shadow can make progress during chunked prefill.
+            # Without this, the main consumes the entire budget, the
+            # shadow gets 0 tokens, and the pair is preempted — causing
+            # a deadlock when all waiting CFG pairs are large.
+            if request.cfg_shadow_id:
+                num_new_tokens = min(num_new_tokens,
+                                     max(1, token_budget // 2))
+
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
             num_new_tokens = min(
@@ -801,6 +810,12 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+
+                    # CFG: reserve half the token budget for the shadow.
+                    if request.cfg_shadow_id:
+                        num_new_tokens = min(num_new_tokens,
+                                             max(1, token_budget // 2))
+
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -1683,6 +1698,21 @@ class Scheduler(SchedulerInterface):
         for partner in cfg_partners_to_stop:
             partner.status = RequestStatus.FINISHED_STOPPED
             self._free_request(partner)
+            # Create an output so the output processor knows this
+            # request is done.  Without this, if the auto-stopped
+            # partner is a MAIN request (edge case during heavy
+            # preemption), the HTTP handler would hang forever
+            # waiting for a final output that never arrives.
+            outputs[partner.client_index].append(
+                EngineCoreOutput(
+                    request_id=partner.request_id,
+                    new_token_ids=[],
+                    finish_reason=partner.get_finished_reason(),
+                    events=partner.take_events(),
+                    trace_headers=partner.trace_headers,
+                    num_cached_tokens=partner.num_cached_tokens,
+                )
+            )
             # Partner could be in running OR waiting (if preempted).
             # Must remove from the correct queue.
             if partner.request_id in {r.request_id for r in self.running}:
