@@ -3057,7 +3057,8 @@ class GPUModelRunner(
             # steps, but SKIPS mixed prefill/decode steps (input_ids
             # shape != batch size).  This tracker ensures phase
             # transitions are never missed during mixed steps.
-            if hasattr(_slm, "_per_req_config"):
+            if (hasattr(_slm, "_per_req_config")
+                    and hasattr(_slm.config, "eot_token_id")):
                 rc = _slm._per_req_config.get(req_id)
                 if (rc is not None
                         and rc.get("mode") == "text_audio"
@@ -3099,6 +3100,82 @@ class GPUModelRunner(
                     _gid = _rc.get('cfg_group_id')
                     if _gid and _gid in _main_phase_by_group:
                         _rc['phase'] = _main_phase_by_group[_gid]
+
+        # OpusLM: advance phase using sampled tokens.
+        # Phases (text->audio path): text -> pre_audio -> audio
+        # -> audio_flush (nq-1 steps) -> audio_stop -> EOS.
+        # For non-audio-output modes (audio_text/text_text), keep text phase
+        # and let EOS stop.
+        _opuslm = getattr(self.model, 'runnable', self.model)
+        if (hasattr(_opuslm, '_stream18_history')
+                and hasattr(_opuslm, '_per_req_config')):
+            _opuslm_cfg_obj = _opuslm.config
+            _opuslm_is_dialogue = getattr(_opuslm, '_is_dialogue', False)
+            for _opu_idx in range(num_sampled_tokens):
+                _opu_rid = req_ids[_opu_idx]
+                _opu_rc = _opuslm._per_req_config.get(_opu_rid)
+                if _opu_rc is None:
+                    continue
+                _opu_sampled_token: int | None = None
+                if self.use_async_scheduling:
+                    if _opu_idx not in invalid_req_indices_set:
+                        _opu_sampled_token = int(
+                            sampled_token_ids[_opu_idx, 0].item())
+                else:
+                    _opu_ids = valid_sampled_token_ids[_opu_idx]
+                    if _opu_ids:
+                        _opu_sampled_token = _opu_ids[-1]
+                if _opu_sampled_token is None:
+                    continue
+
+                _opu_mode = _opu_rc.get("mode", "text_audio")
+                if _opu_mode in ("audio_text", "text_text", "text_dialogue"):
+                    # Text-only generation modes do not enter codec
+                    # segment decode phases.
+                    continue
+
+                _opu_phase = _opu_rc.get("phase", "text")
+                _opu_text_bpe_id = _opuslm_cfg_obj.text_bpe_start_end_token_id
+                _opu_codec_marker_id = _opuslm_cfg_obj.codec_ssl_start_end_token_id
+                _opu_nq = _opuslm_cfg_obj.nq  # 9 (delay = nq-1 = 8)
+                if _opu_phase == "text":
+                    if _opu_sampled_token == _opu_codec_marker_id:
+                        # Model generated <codec_ssl_start/end>(34) →
+                        # transition to audio generation.
+                        _opu_rc["phase"] = "audio"
+                        _opu_rc["audio_step"] = 0
+                    elif (not _opu_rc.get("is_dialogue", _opuslm_is_dialogue)
+                          and _opu_sampled_token == _opu_text_bpe_id):
+                        # Non-dialogue OpusLM: token 35 signals transition
+                        # to pre_audio (which forces 34 → audio).
+                        # For dialogue: token 35 is text_bpe modality marker
+                        # used within text generation — do NOT transition.
+                        _opu_rc["phase"] = "pre_audio"
+                elif _opu_phase == "pre_audio":
+                    if _opu_sampled_token == _opu_codec_marker_id:
+                        _opu_rc["phase"] = "audio"
+                        _opu_rc["audio_step"] = 0
+                elif _opu_phase == "audio":
+                    _opu_rc["audio_step"] = int(
+                        _opu_rc.get("audio_step", 0)
+                    ) + 1
+                    # ARDelay semantics: transition to flush after EOS only.
+                    if _opu_sampled_token == _opuslm_cfg_obj.eos_token_id:
+                        _opu_rc["phase"] = "audio_flush"
+                        _opu_rc["flush_remaining"] = _opu_nq - 1
+                        _opu_rc["flush_step"] = 1
+                elif _opu_phase == "audio_flush":
+                    _opu_rc["audio_step"] = int(
+                        _opu_rc.get("audio_step", 0)
+                    ) + 1
+                    rem = int(_opu_rc.get("flush_remaining", 0)) - 1
+                    _opu_rc["flush_remaining"] = max(rem, 0)
+                    _opu_rc["flush_step"] = int(
+                        _opu_rc.get("flush_step", 1)
+                    ) + 1
+                    if rem <= 0:
+                        _opu_rc["phase"] = "audio_stop"
+                # audio_stop: model forces EOS → vLLM stops the request
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -3665,6 +3742,94 @@ class GPUModelRunner(
                             _speechlm._per_req_config[_rid] = (
                                 dict(_sp.extra_args))
 
+            # OpusLM: sync batch request IDs and per-request config.
+            # Detected by _stream18_history (distinct from SpeechLM's _stream17_history).
+            _opuslm_fwd = getattr(self.model, 'runnable', self.model)
+            if (hasattr(_opuslm_fwd, '_stream18_history')
+                    and hasattr(_opuslm_fwd, '_current_batch_req_ids')):
+                _opu_num = self.input_batch.num_reqs
+                _opu_rids = list(self.input_batch.req_ids[:_opu_num])
+                _opuslm_fwd._current_batch_req_ids = _opu_rids
+                for _opu_rid in _opu_rids:
+                    if _opu_rid not in self.requests:
+                        continue
+
+                    _opu_req_state = self.requests[_opu_rid]
+                    _opu_sp = _opu_req_state.sampling_params
+                    _opu_extra = (
+                        dict(_opu_sp.extra_args)
+                        if _opu_sp and _opu_sp.extra_args
+                        else {}
+                    )
+                    _opu_phase_override = _opu_extra.pop("phase", None)
+                    _opu_rc = _opuslm_fwd._per_req_config.get(_opu_rid)
+
+                    # Infer default mode from multimodal input:
+                    # audio input -> audio_text; otherwise text_audio.
+                    _has_audio_input = any(
+                        getattr(_mmf, "modality", None) == "audio"
+                        for _mmf in _opu_req_state.mm_features
+                    )
+                    _requested_mode = _opu_extra.get("mode")
+                    if _requested_mode in (
+                        "text_audio", "audio_text", "text_text",
+                        "audio_dialogue", "text_dialogue",
+                    ):
+                        _default_mode = _requested_mode
+                    else:
+                        _default_mode = (
+                            "audio_text" if _has_audio_input else "text_audio"
+                        )
+                    # Task-aligned defaults:
+                    # - text_audio / audio_dialogue: start audio decode
+                    # - text_dialogue: text generation
+                    # - audio_text / text_text: text-phase decoding
+                    if _default_mode in ("text_audio", "audio_dialogue"):
+                        _default_phase = "audio"
+                    elif _default_mode == "text_dialogue":
+                        _default_phase = "text"
+                    else:
+                        _default_phase = "audio" if _default_mode == "text_audio" else "text"
+
+                    if _opu_rc is None:
+                        _opu_rc = {
+                            "mode": _default_mode,
+                            "phase": _default_phase,
+                            "flush_remaining": 0,
+                            "flush_step": 0,
+                            "audio_step": 0,
+                            "is_dialogue": _default_mode in (
+                                "audio_dialogue", "text_dialogue",
+                            ),
+                        }
+                        if isinstance(_opu_phase_override, str):
+                            _opu_rc["phase"] = _opu_phase_override
+                        _opuslm_fwd._per_req_config[_opu_rid] = _opu_rc
+
+                    # Merge user overrides without dropping inferred defaults.
+                    # Keep runtime phase transitions authoritative after init.
+                    _opu_rc.update(_opu_extra)
+                    _opu_mode = _opu_rc.get("mode", _default_mode)
+                    if _opu_mode not in (
+                        "text_audio",
+                        "audio_text",
+                        "text_text",
+                        "audio_dialogue",
+                        "text_dialogue",
+                    ):
+                        _opu_mode = _default_mode
+                    if _has_audio_input and _opu_mode == "text_text":
+                        _opu_mode = "audio_text"
+                    _opu_rc["mode"] = _opu_mode
+                    _opu_rc.setdefault("phase", _default_phase)
+                    _opu_rc.setdefault("flush_remaining", 0)
+                    _opu_rc.setdefault("flush_step", 0)
+                    _opu_rc.setdefault("audio_step", 0)
+                    _opu_rc.setdefault(
+                        "audio_minlen",
+                        int(getattr(_opuslm_fwd.config, "audio_minlen", 3)),
+                    )
+
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -3901,6 +4066,13 @@ class GPUModelRunner(
             getattr(self.model, 'runnable', self.model),
             '_stream0_history', None)
         if _speechlm_audio is not None:
+            _slm = getattr(self.model, 'runnable', self.model)
+            cfg = _slm.config
+            # SpeechLM path only: OpusLM has a dedicated tracker below.
+            if not hasattr(cfg, "codec_base_offset"):
+                _speechlm_audio = None
+
+        if _speechlm_audio is not None:
             # Resolve actual sampled tokens.  With async scheduling
             # valid_sampled_token_ids is [] (tokens stay on GPU).
             # Fall back to reading from the GPU sampler output.
@@ -3910,8 +4082,6 @@ class GPUModelRunner(
                 if _gpu is not None and _gpu.numel() > 0:
                     _sampled = _gpu[:, 0].tolist()
                     _sampled = [[t] for t in _sampled]
-            _slm = getattr(self.model, 'runnable', self.model)
-            cfg = _slm.config
             n_sampled = len(_sampled)
             for i, req_id in enumerate(req_ids_output_copy):
                 if i >= n_sampled:
@@ -3951,6 +4121,61 @@ class GPUModelRunner(
                             if audio_outputs is None:
                                 audio_outputs = {}
                             audio_outputs[req_id] = b64
+
+        # OpusLM: track stream 0 SSL tokens and decode audio on completion.
+        _opuslm_audio = getattr(
+            getattr(self.model, 'runnable', self.model),
+            '_stream18_history', None)
+        if _opuslm_audio is not None:
+            _opu_slm = getattr(self.model, 'runnable', self.model)
+            _opu_sampled = valid_sampled_token_ids
+            if not _opu_sampled and sampler_output is not None:
+                _opu_gpu = sampler_output.sampled_token_ids
+                if _opu_gpu is not None and _opu_gpu.numel() > 0:
+                    _opu_sampled = _opu_gpu[:, 0].tolist()
+                    _opu_sampled = [[t] for t in _opu_sampled]
+            _opu_cfg = _opu_slm.config
+            _n_opu = len(_opu_sampled)
+            for _opu_i, _opu_rid in enumerate(req_ids_output_copy):
+                if _opu_i >= _n_opu:
+                    break
+                _opu_rc = _opu_slm._per_req_config.get(_opu_rid)
+                if (not _opu_rc
+                        or _opu_rc.get("mode") not in (
+                            "text_audio", "audio_dialogue")
+                        or _opu_rc.get("phase")
+                        not in ("audio", "audio_flush", "audio_stop")):
+                    continue
+                _opu_tokens = _opu_sampled[_opu_i]
+                if not _opu_tokens:
+                    continue
+                _opu_tok = _opu_tokens[-1]
+                _opu_ssl_s = _opu_cfg.ssl_token_start
+                _opu_ssl_e = _opu_cfg.ssl_token_end
+                if _opu_ssl_s <= _opu_tok < _opu_ssl_e:
+                    _opu_slm._stream0_history.setdefault(
+                        _opu_rid, []).append(_opu_tok)
+                _opu_phase = _opu_rc.get("phase")
+                _opu_should_decode = (
+                    _opu_phase == "audio_stop"
+                    and _opu_tok == _opu_cfg.eos_token_id
+                )
+                if not _opu_should_decode:
+                    _opu_req_state = self.requests.get(_opu_rid)
+                    if _opu_req_state and _opu_req_state.sampling_params:
+                        _opu_max_t = _opu_req_state.sampling_params.max_tokens
+                        if (_opu_max_t and
+                                len(_opu_req_state.output_token_ids) >= _opu_max_t):
+                            _opu_should_decode = True
+                if _opu_should_decode:
+                    _opu_s0 = _opu_slm._stream0_history.pop(_opu_rid, [])
+                    if _opu_s0:
+                        _opu_b64 = _opu_slm.encode_audio_to_base64_wav(
+                            _opu_rid, _opu_s0)
+                        if _opu_b64:
+                            if audio_outputs is None:
+                                audio_outputs = {}
+                            audio_outputs[_opu_rid] = _opu_b64
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.model_config.enable_return_routed_experts:

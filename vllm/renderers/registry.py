@@ -20,6 +20,8 @@ _VLLM_RENDERERS = {
     "hf": ("hf", "HfRenderer"),
     "grok2": ("grok2", "Grok2Renderer"),
     "mistral": ("mistral", "MistralRenderer"),
+    "opuslm": ("hf", "HfRenderer"),
+    "opuslm_dialogue": ("hf", "HfRenderer"),
     "terratorch": ("terratorch", "TerratorchRenderer"),
 }
 
@@ -84,5 +86,9 @@ def renderer_from_config(config: "ModelConfig", **kwargs):
     return RENDERER_REGISTRY.load_renderer(
         renderer_mode,
         config,
-        tokenizer_kwargs={**kwargs, "tokenizer_name": tokenizer_name},
+        tokenizer_kwargs={
+            **kwargs,
+            "tokenizer_name": tokenizer_name,
+            "tokenizer_mode": tokenizer_mode,
+        },
     )

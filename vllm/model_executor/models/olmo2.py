@@ -127,6 +127,22 @@ class Olmo2Attention(nn.Module):
         ) is not None and layer_types[layer_idx] == "sliding_attention":
             sliding_window = self.config.sliding_window
 
+        def _get_rope_parameters() -> dict[str, object]:
+            rope_parameters = getattr(self.config, "rope_parameters", None)
+            if rope_parameters is not None:
+                return dict(rope_parameters)
+
+            rope_theta = float(getattr(self.config, "rope_theta", 10000.0))
+            rope_scaling = getattr(self.config, "rope_scaling", None)
+            if isinstance(rope_scaling, dict):
+                rope_parameters = dict(rope_scaling)
+                if "rope_type" not in rope_parameters and "type" in rope_parameters:
+                    rope_parameters["rope_type"] = rope_parameters.pop("type")
+                rope_parameters.setdefault("rope_theta", rope_theta)
+                return rope_parameters
+
+            return {"rope_type": "default", "rope_theta": rope_theta}
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -139,10 +155,11 @@ class Olmo2Attention(nn.Module):
         )
 
         # Rotary embeddings. Rope scaling is only applied on full attention layers.
+        base_rope_parameters = _get_rope_parameters()
         if sliding_window is None:
-            rope_parameters = self.config.rope_parameters
+            rope_parameters = base_rope_parameters
         else:
-            rope_theta = self.config.rope_parameters["rope_theta"]
+            rope_theta = float(base_rope_parameters.get("rope_theta", 10000.0))
             rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}
         self.rotary_emb = get_rope(
             self.head_dim,

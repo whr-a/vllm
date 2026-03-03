@@ -27,7 +27,7 @@ from vllm.entrypoints.chat_utils import (
 )
 from vllm.logger import init_logger
 from vllm.tokenizers import cached_get_tokenizer
-from vllm.tokenizers.hf import CachedHfTokenizer, HfTokenizer
+from vllm.tokenizers.hf import HfTokenizer
 from vllm.transformers_utils.chat_templates import get_chat_template_fallback_path
 from vllm.transformers_utils.processor import cached_get_processor
 from vllm.utils.func_utils import supports_kw
@@ -611,7 +611,6 @@ class HfRenderer(BaseRenderer):
             tokenizer = cast(
                 HfTokenizer,
                 cached_get_tokenizer(
-                    tokenizer_cls=CachedHfTokenizer,  # type: ignore[type-abstract]
                     **tokenizer_kwargs,
                 ),
             )

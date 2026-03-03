@@ -92,6 +92,16 @@ class InputPreprocessor:
             )
             return None
 
+        # Prefer the model config's eos_token_id when it is a single int.
+        # This is necessary for models (e.g. OpusLM) that reuse a generic
+        # tokenizer whose eos_token_id is unrelated to the model's actual EOS
+        # token.  When the two IDs differ, update_from_generation_config would
+        # add the model EOS to stop_token_ids (as an "extra" EOS), bypassing
+        # the defer logic and causing premature termination.
+        hf_eos = getattr(self.model_config.hf_config, "eos_token_id", None)
+        if isinstance(hf_eos, int):
+            return hf_eos
+
         return self.tokenizer.eos_token_id
 
     def get_decoder_start_token_id(self) -> int:

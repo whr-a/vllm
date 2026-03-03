@@ -464,6 +464,14 @@ _MULTIMODAL_MODELS = {
         "speechlm",
         "SpeechLMForConditionalGeneration",
     ),
+    "OpusLMForConditionalGeneration": (
+        "opuslm",
+        "OpusLMForConditionalGeneration",
+    ),
+    "OpusLMDialogueForConditionalGeneration": (
+        "opuslm_dialogue",
+        "OpusLMDialogueForConditionalGeneration",
+    ),
     "Qwen3VLForConditionalGeneration": ("qwen3_vl", "Qwen3VLForConditionalGeneration"),  # noqa: E501
     "Qwen3VLMoeForConditionalGeneration": (
         "qwen3_vl_moe",

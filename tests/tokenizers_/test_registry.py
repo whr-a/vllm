@@ -75,3 +75,16 @@ def test_customized_tokenizer():
     assert tokenizer.bos_token_id == 0
     assert tokenizer.eos_token_id == 1
     assert tokenizer.pad_token_id == 2
+
+
+def test_resolve_tokenizer_args_opuslm_short_circuit():
+    tokenizer_mode, tokenizer_name, args, kwargs = resolve_tokenizer_args(
+        "dummy-tokenizer",
+        tokenizer_mode="auto",
+        model_type="opuslm",
+    )
+
+    assert tokenizer_mode == "opuslm"
+    assert tokenizer_name == "dummy-tokenizer"
+    assert args == ()
+    assert kwargs["truncation_side"] == "left"

@@ -265,3 +265,28 @@ cfg.md
 speechlm-qwen3-8b
 
 usage.md
+
+# OpusLM dev notes
+claude_dump.md
+codex_plan.md
+implemented.md
+opuslm_plan.md
+status.md
+
+# OpusLM test/debug directories
+debug_decode/
+scripts_test/
+tmp_tts_local/
+tmp_tts_local_check/
+tmp_tts_local_fix/
+tmp_tts_local_fix2/
+
+# OpusLM checkpoints
+opuslm_dialogue_ckpt/
+
+# Test audio files
+test_*.wav
+
+# Server scripts
+start_server.sh
+server_dialogue.log

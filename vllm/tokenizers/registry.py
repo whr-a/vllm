@@ -36,6 +36,8 @@ _VLLM_TOKENIZERS = {
     "grok2": ("grok2", "Grok2Tokenizer"),
     "hf": ("hf", "CachedHfTokenizer"),
     "mistral": ("mistral", "MistralTokenizer"),
+    "opuslm": ("opuslm", "OpusLMTokenizer"),
+    "opuslm_dialogue": ("opuslm_dialogue", "OpusLMDialogueTokenizer"),
 }
 
 
@@ -85,6 +87,7 @@ def resolve_tokenizer_args(
     *args,
     runner_type: "RunnerType" = "generate",
     tokenizer_mode: str = "auto",
+    model_type: str | None = None,
     **kwargs,
 ):
     revision: str | None = kwargs.get("revision")
@@ -143,6 +146,13 @@ def resolve_tokenizer_args(
         tokenizer_mode = "hf"
         kwargs["use_fast"] = False
 
+    # OpusLM uses a shifted global vocabulary layout:
+    # tokenizer IDs are mapped to [text_token_start, text_token_end) at runtime.
+    if tokenizer_mode == "auto" and model_type == "opuslm":
+        tokenizer_mode = "opuslm"
+    if tokenizer_mode == "auto" and model_type == "opuslm_dialogue":
+        tokenizer_mode = "opuslm_dialogue"
+
     # Try to use official Mistral tokenizer if possible
     if (
         tokenizer_mode == "auto"
@@ -176,10 +186,39 @@ cached_resolve_tokenizer_args = lru_cache(resolve_tokenizer_args)
 
 
 def tokenizer_args_from_config(config: "ModelConfig", **kwargs):
+    model_type = getattr(config.hf_config, "model_type", None)
+    if model_type == "opuslm":
+        kwargs = dict(kwargs)
+        kwargs.setdefault(
+            "opuslm_text_token_offset",
+            int(getattr(config.hf_config, "text_token_start", 13448)),
+        )
+        kwargs.setdefault(
+            "opuslm_text_token_end",
+            int(getattr(config.hf_config, "text_token_end", 113800)),
+        )
+        kwargs.setdefault(
+            "opuslm_pad_token_id",
+            int(getattr(config.hf_config, "pad_token_id", 0)),
+        )
+        kwargs.setdefault(
+            "opuslm_eos_token_id",
+            int(getattr(config.hf_config, "eos_token_id", 5)),
+        )
+        kwargs.setdefault(
+            "opuslm_codec_ssl_start_end_token_id",
+            int(getattr(config.hf_config, "codec_ssl_start_end_token_id", 34)),
+        )
+        kwargs.setdefault(
+            "opuslm_text_bpe_start_end_token_id",
+            int(getattr(config.hf_config, "text_bpe_start_end_token_id", 35)),
+        )
+
     return cached_resolve_tokenizer_args(
         config.tokenizer,
         runner_type=config.runner_type,
         tokenizer_mode=config.tokenizer_mode,
+        model_type=model_type,
         revision=config.tokenizer_revision,
         trust_remote_code=config.trust_remote_code,
         **kwargs,
