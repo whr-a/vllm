@@ -3131,7 +3131,10 @@ class GPUModelRunner(
                 _opu_mode = _opu_rc.get("mode", "text_audio")
                 if _opu_mode in ("audio_text", "text_text", "text_dialogue"):
                     # Text-only generation modes do not enter codec
-                    # segment decode phases.
+                    # segment decode phases.  Track text_step for minlen.
+                    _opu_rc["text_step"] = int(
+                        _opu_rc.get("text_step", 0)
+                    ) + 1
                     continue
 
                 _opu_phase = _opu_rc.get("phase", "text")
@@ -3139,6 +3142,9 @@ class GPUModelRunner(
                 _opu_codec_marker_id = _opuslm_cfg_obj.codec_ssl_start_end_token_id
                 _opu_nq = _opuslm_cfg_obj.nq  # 9 (delay = nq-1 = 8)
                 if _opu_phase == "text":
+                    _opu_rc["text_step"] = int(
+                        _opu_rc.get("text_step", 0)
+                    ) + 1
                     if _opu_sampled_token == _opu_codec_marker_id:
                         # Model generated <codec_ssl_start/end>(34) →
                         # transition to audio generation.
@@ -3825,9 +3831,14 @@ class GPUModelRunner(
                     _opu_rc.setdefault("flush_remaining", 0)
                     _opu_rc.setdefault("flush_step", 0)
                     _opu_rc.setdefault("audio_step", 0)
+                    _opu_rc.setdefault("text_step", 0)
                     _opu_rc.setdefault(
                         "audio_minlen",
                         int(getattr(_opuslm_fwd.config, "audio_minlen", 3)),
+                    )
+                    _opu_rc.setdefault(
+                        "text_minlen",
+                        int(getattr(_opuslm_fwd.config, "text_minlen", 1)),
                     )
 
             model_output = self._model_forward(
@@ -4152,7 +4163,13 @@ class GPUModelRunner(
                 _opu_tok = _opu_tokens[-1]
                 _opu_ssl_s = _opu_cfg.ssl_token_start
                 _opu_ssl_e = _opu_cfg.ssl_token_end
-                if _opu_ssl_s <= _opu_tok < _opu_ssl_e:
+                # Collect ALL audio-phase stream0 tokens (not just
+                # SSL).  If a non-SSL token slips through (e.g. 34),
+                # it must still be counted to keep stream0/stream18
+                # history lengths aligned for de-interleaving.
+                _opu_cur_phase = _opu_rc.get("phase")
+                if (_opu_cur_phase == "audio"
+                        and _opu_tok != _opu_cfg.eos_token_id):
                     _opu_slm._stream0_history.setdefault(
                         _opu_rid, []).append(_opu_tok)
                 _opu_phase = _opu_rc.get("phase")

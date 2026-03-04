@@ -86,6 +86,7 @@ class OpusLMDialogueConfig(PretrainedConfig):
         audio_temperature: float = 0.8,
         audio_topk: int = 30,
         audio_minlen: int = 3,
+        text_minlen: int = 1,
         # Codec/SSL model tags
         dac_hf_model_tag: str = "ftshijt/espnet_codec_dac_large_v1.4_360epoch",
         xeus_hf_model_tag: str = "espnet/xeus",
@@ -154,6 +155,7 @@ class OpusLMDialogueConfig(PretrainedConfig):
         self.audio_temperature = audio_temperature
         self.audio_topk = audio_topk
         self.audio_minlen = audio_minlen
+        self.text_minlen = text_minlen
 
         # External model tags
         self.dac_hf_model_tag = dac_hf_model_tag

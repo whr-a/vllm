@@ -76,9 +76,9 @@ class OpusLMConfig(PretrainedConfig):
         num_codec_streams: int = 8,
         codec_per_stream_size: int = 1024,
         # Audio generation parameters
-        audio_temperature: float = 0.8,
+        audio_temperature: float = 0.7,
         audio_topk: int = 30,
-        audio_minlen: int = 3,
+        audio_minlen: int = 50,
         # Codec/SSL model tags
         dac_hf_model_tag: str = "ftshijt/espnet_codec_dac_large_v1.4_360epoch",
         xeus_hf_model_tag: str = "espnet/xeus",

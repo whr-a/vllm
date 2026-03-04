@@ -149,6 +149,11 @@ class _OpusLMAudioInputProcessor:
             None, ckpt_path, device="cpu"
         )
         self._ssl_model.eval()
+        # Disable masking so encode() produces deterministic features
+        # (matches ESPnet data prep which uses use_mask=False).
+        if hasattr(self._ssl_model, "util_attributes"):
+            self._ssl_model.util_attributes.discard("mask")
+            self._ssl_model.util_attributes.discard("block_mask")
         self._kmeans_model = joblib.load(km_path)
         return self._ssl_model, self._kmeans_model
 
@@ -271,14 +276,27 @@ class _OpusLMGPUAudioInputProcessor:
         return self._dac_model
 
     def _resolve_xeus_paths(self) -> tuple[str, str]:
-        from huggingface_hub import hf_hub_download
-        repo = self.cfg.xeus_hf_model_tag
-        ckpt_file = getattr(
-            self.cfg, "xeus_checkpoint_filename", "model/xeus_checkpoint_new.pth"
-        )
-        km_file = self.cfg.km_model_filename
-        ckpt_path = hf_hub_download(repo, ckpt_file)
-        km_path = hf_hub_download(repo, km_file)
+        import os
+        # Support local paths: if xeus_local_checkpoint / km_local_path
+        # are set and point to existing files, use them directly.
+        local_ckpt = getattr(self.cfg, "xeus_local_checkpoint", None)
+        local_km = getattr(self.cfg, "km_local_path", None)
+        if local_ckpt and os.path.isfile(local_ckpt):
+            ckpt_path = local_ckpt
+        else:
+            from huggingface_hub import hf_hub_download
+            repo = self.cfg.xeus_hf_model_tag
+            ckpt_file = getattr(
+                self.cfg, "xeus_checkpoint_filename",
+                "model/xeus_checkpoint_new.pth",
+            )
+            ckpt_path = hf_hub_download(repo, ckpt_file)
+        if local_km and os.path.isfile(local_km):
+            km_path = local_km
+        else:
+            from huggingface_hub import hf_hub_download
+            repo = self.cfg.xeus_hf_model_tag
+            km_path = hf_hub_download(repo, self.cfg.km_model_filename)
         return ckpt_path, km_path
 
     def _load_ssl_and_kmeans(self):
@@ -297,6 +315,11 @@ class _OpusLMGPUAudioInputProcessor:
             None, ckpt_path, device=str(self.device)
         )
         self._ssl_model.eval()
+        # Disable masking so encode() produces deterministic features
+        # (matches ESPnet data prep which uses use_mask=False).
+        if hasattr(self._ssl_model, "util_attributes"):
+            self._ssl_model.util_attributes.discard("mask")
+            self._ssl_model.util_attributes.discard("block_mask")
         logger.info("Loaded XEUS SSL model on %s", self.device)
         self._kmeans_model = joblib.load(km_path)
         self._km_centroids = torch.from_numpy(
@@ -417,9 +440,11 @@ class OpusLMDummyInputsBuilder(
 ):
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
-        num_audios = mm_counts.get("audio", 0)
-        # Use the audio placeholder token string
-        return "<codec_ssl_start_end>" * num_audios
+        # Dummy text — _call_hf_processor ignores this when it has audio.
+        # The framework needs placeholder token [34] in the final input_ids
+        # to apply prompt replacements; _call_hf_processor inserts [34]
+        # directly via _layout_task_sequence for audio-bearing sequences.
+        return "dummy"
 
     def get_dummy_mm_data(
         self,
@@ -586,9 +611,18 @@ class OpusLMMultiModalProcessor(
         }
 
         if task_token_id in tts_task_ids:
+            # NOTE: the OpusLMTokenizer already shifts text IDs by
+            # +text_token_start (13448) during encode/call, so body_ids
+            # arriving here are already in the model's global ID space.
+            # Do NOT apply the offset again.
+
             # Condition segment: <text_bpe_start/end> + text payload.
             if len(body_ids) == 0 or body_ids[0] != cfg.text_bpe_start_end_token_id:
                 seq = [sos, int(task_token_id), cfg.text_bpe_start_end_token_id] + body_ids
+            # Inter-segment padding after text condition (ESPnet: nq-1 = 8
+            # zero frames to prevent DAC overlap after delay interleaving).
+            inter_pad = int(getattr(cfg, "nq", 9)) - 1  # 8
+            seq.extend([0] * inter_pad)
             # Target segment prefix: <codec_ssl_start/end>.
             if seq[-1] != cfg.codec_ssl_start_end_token_id:
                 seq.append(cfg.codec_ssl_start_end_token_id)
@@ -604,11 +638,12 @@ class OpusLMMultiModalProcessor(
         )
         return cls._set_input_ids(text_inputs, new_input_ids)
 
-    def _get_audio_input_processor(self) -> _OpusLMAudioInputProcessor:
+    def _get_audio_input_processor(self) -> _OpusLMGPUAudioInputProcessor:
         cfg = self.info.get_hf_config()
         processor = getattr(self, "_audio_input_processor", None)
         if processor is None:
-            processor = _OpusLMAudioInputProcessor(cfg)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            processor = _OpusLMGPUAudioInputProcessor(cfg, device=device)
             self._audio_input_processor = processor
         return processor
 
@@ -628,14 +663,28 @@ class OpusLMMultiModalProcessor(
         cfg = self.info.get_hf_config()
         mode_obj = mm_kwargs.get("mode")
         task_obj = mm_kwargs.get("task")
+        _pre_tokens = mm_kwargs.get("pre_tokens")
+        _has_pre = bool(
+            _pre_tokens and isinstance(_pre_tokens, (list, tuple))
+        )
         task_token_id = self.resolve_task_token_id(
             cfg,
-            has_audio_input=bool(audios),
+            has_audio_input=bool(audios) or _has_pre,
             mode=mode_obj if isinstance(mode_obj, str) else None,
             task=task_obj if isinstance(task_obj, (str, int)) else None,
         )
 
         # --- Dialogue path: structured messages ---
+        # Only use the dialogue sequence builder for dialogue tasks (which
+        # need role tokens like <user>, <assistant>, <system>).  Non-dialogue
+        # tasks (ASR, TTS, plain_tts, audiolm) must go through the single-
+        # turn path to produce the correct ESPnet sequence without role tokens.
+        _dialogue_task_ids = {
+            int(getattr(cfg, "audio_dialogue_task_token_id", 89)),
+            int(getattr(cfg, "text_dialogue_task_token_id", 88)),
+        }
+        _is_dialogue_task = int(task_token_id) in _dialogue_task_ids
+
         messages = mm_kwargs.get("messages")
         pre_tokens = mm_kwargs.get("pre_tokens")
         if pre_tokens and isinstance(pre_tokens, (list, tuple)):
@@ -665,11 +714,29 @@ class OpusLMMultiModalProcessor(
                         rebuilt.append(msg)
             messages = rebuilt if rebuilt else messages
 
-        if messages and isinstance(messages, (list, tuple)):
+        if _is_dialogue_task and messages and isinstance(messages, (list, tuple)):
             mode = mode_obj if isinstance(mode_obj, str) else None
             return self._build_dialogue_sequence(
                 cfg, tokenizer, task_token_id, messages, audios, mode=mode
             )
+
+        # For non-dialogue tasks, extract text and audio from messages
+        # so they can be processed through the single-turn path.
+        if messages and isinstance(messages, (list, tuple)):
+            _text_parts = []
+            for msg in messages:
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    if content:
+                        _text_parts.append(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            if part.get("type") == "text":
+                                _text_parts.append(part.get("text", ""))
+                            elif part.get("type") == "input_audio":
+                                pass  # audios already extracted above
+            prompt = " ".join(_text_parts) if _text_parts else prompt
 
         # --- Single-turn path (existing) ---
         text_inputs = tokenizer(prompt, return_tensors="pt")
@@ -677,20 +744,145 @@ class OpusLMMultiModalProcessor(
             text_inputs, cfg, task_token_id
         )
 
-        if not audios:
+        pre_tokens = mm_kwargs.get("pre_tokens")
+        has_pre_tokens = bool(
+            pre_tokens and isinstance(pre_tokens, (list, tuple))
+        )
+        if not audios and not has_pre_tokens:
             return BatchFeature(data={**text_inputs})
 
-        audio_processor = self._get_audio_input_processor()
+        # Build clean OpusLM task sequence: the chat template produces
+        # GPT2 token IDs (e.g. for "<|user|><audio>") that are meaningless
+        # to the OpusLM model.  Strip them and construct the correct
+        # sequence: [sos, task, placeholder(34), text_bpe_start(35)]
+        ph = int(cfg.codec_ssl_start_end_token_id)  # 34
+        tbs = int(cfg.text_bpe_start_end_token_id)  # 35
+        input_ids = text_inputs["input_ids"]
+        if isinstance(input_ids, torch.Tensor) and input_ids.ndim == 2:
+            ids = input_ids[0].tolist()
+            sos = int(getattr(cfg, "sos_eos_token_id", cfg.eos_token_id))
+            if ph not in ids:
+                # Rebuild: [sos, task, placeholder×N, text_bpe_start]
+                n_audio = max(len(audios), len(pre_tokens) if has_pre_tokens else 0)
+                ids = [sos, int(task_token_id)]
+                for _ in range(n_audio):
+                    ids.append(ph)
+                ids.append(tbs)
+                text_inputs = self._set_input_ids(
+                    text_inputs,
+                    torch.tensor([ids], dtype=input_ids.dtype,
+                                 device=input_ids.device),
+                )
+
         stream0_chunks = list[torch.Tensor]()
         stream18_chunks = list[torch.Tensor]()
         lengths = list[int]()
 
-        for audio in audios:
-            stream0, streams18 = audio_processor.encode_audio_tokens(audio)
-            lengths.append(int(len(stream0)))
-            if len(stream0) > 0:
-                stream0_chunks.append(torch.from_numpy(stream0))
-                stream18_chunks.append(torch.from_numpy(streams18))
+        # ESPnet inter_segment_pad = nq - 1 = 8: zero rows after each audio
+        # segment to prevent DAC token overlap after delay interleaving.
+        inter_pad = int(cfg.nq) - 1  # 8
+
+        codec_ssl_end_id = int(cfg.codec_ssl_start_end_token_id)  # 34
+
+        # Pre-tokenized path: use ARK data instead of on-the-fly encoding
+        pre_tokens = mm_kwargs.get("pre_tokens")
+        if pre_tokens and isinstance(pre_tokens, (list, tuple)):
+            token_bias = int(mm_kwargs.get("token_bias", 0))
+            for pt in pre_tokens:
+                s0 = np.array(pt.get("stream0", []), dtype=np.int64)
+                s18_raw = pt.get("streams18", [])
+                if s18_raw and isinstance(s18_raw[0], list):
+                    s18 = np.array(s18_raw, dtype=np.int64)
+                else:
+                    s18 = np.zeros((len(s0), 8), dtype=np.int64)
+                if token_bias != 0:
+                    s0 = s0 + token_bias
+                    s18 = s18 + token_bias
+                T = len(s0)
+                if T > 0:
+                    end_s0 = np.array([codec_ssl_end_id], dtype=np.int64)
+                    end_s18 = np.zeros(
+                        (1, cfg.num_codec_streams), dtype=np.int64
+                    )
+                    pad_s0 = np.zeros(inter_pad, dtype=np.int64)
+                    pad_s18 = np.zeros(
+                        (inter_pad, cfg.num_codec_streams), dtype=np.int64
+                    )
+                    s0 = np.concatenate([s0, end_s0, pad_s0])
+                    s18 = np.concatenate([s18, end_s18, pad_s18])
+                    lengths.append(T + 1 + inter_pad)
+                    stream0_chunks.append(torch.from_numpy(s0))
+                    stream18_chunks.append(torch.from_numpy(s18))
+                else:
+                    lengths.append(0)
+        else:
+            # Detect whether this is a TTS task (speaker audio needs
+            # fixed-length padding, NOT codec_ssl_end terminator).
+            is_tts = int(task_token_id) in {
+                int(cfg.codec_ssl_tts_task_token_id),
+                int(getattr(cfg, "codec_ssl_plain_tts_task_token_id", 82)),
+            }
+            spk_len = int(getattr(cfg, "speaker_prompt_length", 500))
+
+            audio_processor = self._get_audio_input_processor()
+            for audio in audios:
+                stream0, streams18 = audio_processor.encode_audio_tokens(audio)
+                T = int(len(stream0))
+                if T > 0:
+                    if is_tts:
+                        # TTS speaker reference: pad/clip to exactly
+                        # speaker_prompt_length (500) frames, then add
+                        # inter-segment padding.  No codec_ssl_end.
+                        if T > spk_len:
+                            stream0 = stream0[:spk_len]
+                            streams18 = streams18[:spk_len]
+                        elif T < spk_len:
+                            pad_s0 = np.zeros(
+                                spk_len - T, dtype=np.int64
+                            )
+                            pad_s18 = np.zeros(
+                                (spk_len - T, cfg.num_codec_streams),
+                                dtype=np.int64,
+                            )
+                            stream0 = np.concatenate([stream0, pad_s0])
+                            streams18 = np.concatenate(
+                                [streams18, pad_s18]
+                            )
+                        # Inter-segment padding after speaker segment
+                        pad_s0 = np.zeros(inter_pad, dtype=np.int64)
+                        pad_s18 = np.zeros(
+                            (inter_pad, cfg.num_codec_streams),
+                            dtype=np.int64,
+                        )
+                        stream0 = np.concatenate([stream0, pad_s0])
+                        streams18 = np.concatenate(
+                            [streams18, pad_s18]
+                        )
+                        lengths.append(spk_len + inter_pad)
+                    else:
+                        # ASR / other: audio + codec_ssl_end(34) + pad
+                        end_s0 = np.array(
+                            [codec_ssl_end_id], dtype=np.int64
+                        )
+                        end_s18 = np.zeros(
+                            (1, cfg.num_codec_streams), dtype=np.int64
+                        )
+                        pad_s0 = np.zeros(inter_pad, dtype=np.int64)
+                        pad_s18 = np.zeros(
+                            (inter_pad, cfg.num_codec_streams),
+                            dtype=np.int64,
+                        )
+                        stream0 = np.concatenate(
+                            [stream0, end_s0, pad_s0]
+                        )
+                        streams18 = np.concatenate(
+                            [streams18, end_s18, pad_s18]
+                        )
+                        lengths.append(T + 1 + inter_pad)
+                    stream0_chunks.append(torch.from_numpy(stream0))
+                    stream18_chunks.append(torch.from_numpy(streams18))
+                else:
+                    lengths.append(0)
 
         if stream0_chunks:
             stream0_tensor = torch.cat(stream0_chunks, dim=0).long()
@@ -1191,6 +1383,12 @@ class OpusLMMultiModalProcessor(
                 getattr(cfg, "spk_start_end_token_id", 37)
             )
 
+        # inter_segment_pad appended to each audio chunk
+        inter_pad = int(cfg.nq) - 1  # 8
+
+        is_tts = int(task_token_id) in tts_task_ids
+        target_modality_id = int(cfg.codec_ssl_start_end_token_id)  # 34
+
         def get_replacement_audio(item_idx: int):
             start = offsets[item_idx]
             end = offsets[item_idx + 1]
@@ -1204,15 +1402,37 @@ class OpusLMMultiModalProcessor(
                 )
 
             stream0_ids = audio_stream0_ids[start:end].tolist()
-            tokens = [replacement_boundary_id] + stream0_ids
 
-            def _is_embed(
-                _tokenizer: object,
-                _full: object,
-            ) -> torch.Tensor:
-                mask = torch.ones(len(tokens), dtype=torch.bool)
-                mask[0] = False
-                return mask
+            if is_tts:
+                # TTS: [spk(37)] + [spk_audio×500 + pad×8] + [34]
+                # The stream0_ids already has 500+8=508 items (speaker +
+                # inter-segment pad).  Append [34] as target modality
+                # marker so the model generates audio after it.
+                tokens = (
+                    [replacement_boundary_id]
+                    + stream0_ids
+                    + [target_modality_id]
+                )
+
+                def _is_embed(
+                    _tokenizer: object,
+                    _full: object,
+                ) -> torch.Tensor:
+                    mask = torch.ones(len(tokens), dtype=torch.bool)
+                    mask[0] = False   # [37] spk boundary: text embed
+                    mask[-1] = False  # [34] target marker: text embed
+                    return mask
+            else:
+                # ASR / other: [34] + [audio + codec_ssl_end + pad×8]
+                tokens = [replacement_boundary_id] + stream0_ids
+
+                def _is_embed(
+                    _tokenizer: object,
+                    _full: object,
+                ) -> torch.Tensor:
+                    mask = torch.ones(len(tokens), dtype=torch.bool)
+                    mask[0] = False  # boundary token not embedded
+                    return mask
 
             return PromptUpdateDetails(full=tokens, is_embed=_is_embed)
 
@@ -1350,12 +1570,15 @@ class OpusLMForConditionalGeneration(
         """Precompute token validity masks for each stream."""
         V = config.vocab_size
 
-        # Stream 0 (SSL): allow [ssl_token_start, ssl_token_end)
-        #                      + codec_ssl_start_end (34) + eos (5)
+        # Stream 0 (SSL): allow [ssl_token_start, ssl_token_end) + eos (5)
+        # ESPnet mask: stream 0 can ONLY output SSL tokens and EOS.
+        # Token 34 (codec_ssl_start_end) must NOT be allowed here —
+        # if the model samples it during audio phase, it creates a
+        # mismatch between stream0_history (N_ssl) and stream18_history,
+        # corrupting the de-interleave alignment.
         # EOS is further gated by per-request `audio_minlen` in compute_logits.
         ssl_mask = torch.ones(V, dtype=torch.bool)
         ssl_mask[config.ssl_token_start:config.ssl_token_end] = False
-        ssl_mask[config.codec_ssl_start_end_token_id] = False
         ssl_mask[config.eos_token_id] = False
         self.register_buffer("audio_mask_s0", ssl_mask)
 
@@ -1608,11 +1831,17 @@ class OpusLMForConditionalGeneration(
             s18 = streams18[offset:offset + length]             # [L, 8]
             offset += length
 
+            # Apply delay interleaving: stream k is delayed by k+1 steps
+            delayed_s18 = torch.zeros_like(s18)
+            for k in range(s18.shape[1]):
+                delay = k + 1
+                if delay < length:
+                    delayed_s18[delay:, k] = s18[:length - delay, k]
+
             s0_embed = embed_fn(s0)                             # [L, H]
-            s18_embed = embed_fn(s18)                           # [L, 8, H]
-            s18_embed = s18_embed.masked_fill(
-                (s18 == 0).unsqueeze(-1), 0.0
-            )
+            s18_embed = embed_fn(delayed_s18)                   # [L, 8, H]
+            # Do NOT mask out embed(0) for delayed/pad positions.
+            # ESPnet sums all 9 streams including embed(0) for pad.
             mm_embeddings.append(s0_embed + s18_embed.sum(dim=1))
 
         return tuple(mm_embeddings)
@@ -1641,6 +1870,7 @@ class OpusLMForConditionalGeneration(
 
         # Overwrite placeholder-token embeddings with multimodal embeddings
         # during prefill of audio inputs.
+        mm_positions = None
         if multimodal_embeddings is not None and len(multimodal_embeddings) > 0:
             if is_multimodal is None:
                 raise ValueError(
@@ -1652,14 +1882,33 @@ class OpusLMForConditionalGeneration(
                 multimodal_embeddings=multimodal_embeddings,
                 is_multimodal=is_multimodal,
             )
+            mm_positions = is_multimodal
 
         # Add buffered stream1-8 embeddings for autoregressive audio decode.
+        stream_positions = None
         if self._stream_buffer_dict:
-            stream_embed_positions = self._get_stream_embed_positions(input_ids)
-            if stream_embed_positions.any():
+            stream_positions = self._get_stream_embed_positions(input_ids)
+            if stream_positions.any():
                 inputs_embeds = self._apply_stream_embeddings(
-                    input_ids, inputs_embeds, stream_embed_positions
+                    input_ids, inputs_embeds, stream_positions
                 )
+
+        # ESPnet sums all 9 streams: text positions get 8*embed(0) pad bias
+        # from streams 1-8 being pad(0). Multimodal and audio-decode positions
+        # already have the correct stream embeddings. Add bias to the rest.
+        handled = torch.zeros_like(input_ids, dtype=torch.bool)
+        if mm_positions is not None:
+            handled |= mm_positions
+        if stream_positions is not None:
+            handled |= stream_positions
+        needs_bias = ~handled
+        if needs_bias.any():
+            nq_minus_1 = int(getattr(self.config, "nq", 9)) - 1  # 8
+            pad_bias = self.model.embed_tokens(
+                torch.zeros(1, dtype=torch.long, device=input_ids.device)
+            )  # [1, H]
+            inputs_embeds = inputs_embeds.clone()
+            inputs_embeds[needs_bias] += nq_minus_1 * pad_bias
 
         return inputs_embeds
 
@@ -1835,10 +2084,30 @@ class OpusLMForConditionalGeneration(
                 req_cfg = self._get_req_config(pos)
                 audio_step = int(req_cfg.get("audio_step", 0))
                 audio_minlen = int(
-                    req_cfg.get("audio_minlen", getattr(cfg, "audio_minlen", 3))
+                    req_cfg.get("audio_minlen", getattr(cfg, "audio_minlen", 50))
                 )
                 if audio_step < max(audio_minlen, 0):
                     stream0_logits[pos, cfg.eos_token_id] = float("-inf")
+
+            # ESPnet applies top_k to ALL 9 streams including stream 0
+            # inside logits_to_tokens(). In vLLM, streams 1-8 get top_k in
+            # _sample_and_buffer_streams, but stream 0 goes to the standard
+            # vLLM sampler which uses request-level top_k (often unset/0).
+            # Apply audio_topk filtering to stream 0 here so the sampler
+            # only sees the top-k candidates.  Temperature is NOT applied
+            # here — it comes from the request-level SamplingParams.
+            for pos in audio_positions:
+                req_cfg = self._get_req_config(pos)
+                top_k = int(
+                    req_cfg.get("audio_topk", cfg.audio_topk)
+                )
+                if top_k > 0 and top_k < cfg.vocab_size:
+                    row = stream0_logits[pos]
+                    topk_vals, topk_idx = torch.topk(row, top_k)
+                    stream0_logits[pos] = torch.full_like(
+                        row, float("-inf")
+                    )
+                    stream0_logits[pos].scatter_(0, topk_idx, topk_vals)
 
         if pre_audio_positions:
             # Force codec_ssl_start_end (34) output
@@ -2154,15 +2423,18 @@ class OpusLMForConditionalGeneration(
     ) -> tuple["Any", int]:
         """Decode complete audio from stream 0 SSL + stream 1-8 DAC history.
 
-        The 9-stream delay-interleaved token sequence is:
-          [T, 9] where col 0 = stream 0 (SSL), cols 1-8 = DAC streams
+        ESPnet flow (ar_delay.py):
+          1. Generate all steps including EOS step + nq-1 flush steps
+          2. inverse_delay_interleave on FULL sequence [total_steps, 9]
+          3. Truncate to [:finish_idx - 1] (exclude EOS frame)
 
-        After de-interleaving:
-          [T-8, 9]
+        vLLM:
+          - stream0_ssl_tokens: only SSL tokens (steps before EOS), length=E
+          - stream18_history: entries for ALL audio+flush steps, length=E+1+8=E+9
+            (step E = EOS step, steps E+1..E+8 = flush)
 
-        The SSL stream (col 0) is NOT decoded by DAC — only cols 1-8 are
-        decoded by DAC. The SSL tokens indicate the codec rhythm but the
-        actual audio waveform comes from DAC streams 1-8.
+        To match ESPnet, we must de-interleave the FULL sequence including
+        EOS and flush steps, then truncate to exclude the EOS frame.
 
         Args:
             req_id: Request ID to retrieve stream 1-8 history
@@ -2171,34 +2443,64 @@ class OpusLMForConditionalGeneration(
         import numpy as np
 
         history = self._stream18_history.pop(req_id, [])
+        cfg = self.config
 
-        N = len(stream0_ssl_tokens)
-        if N == 0:
+        N_ssl = len(stream0_ssl_tokens)
+        H = len(history)
+        if N_ssl == 0:
             return np.zeros(0, dtype=np.float32), self._dac_sample_rate
 
         device = next(self.model.parameters()).device
 
-        # Build stream 0 column (SSL tokens)
-        s0 = torch.tensor(stream0_ssl_tokens, dtype=torch.long, device=device)
+        # The full generated sequence has H steps (stream18 records every
+        # audio + flush step).  Stream 0 has N_ssl real SSL tokens (steps
+        # 0..E-1), then EOS at step E, then pad(0) for flush steps E+1..E+8.
+        # So the full stream0 column should be:
+        #   [ssl_0, ssl_1, ..., ssl_{E-1}, eos, 0, 0, ..., 0]  length = H
+        T_full = max(H, N_ssl)  # use the longer of the two
 
-        # Build streams 1-8 from history
-        H = len(history)
+        # Build full stream 0 column: SSL tokens + EOS + pad(0)
+        s0_full = torch.zeros(T_full, dtype=torch.long, device=device)
+        if N_ssl > 0:
+            s0_full[:N_ssl] = torch.tensor(
+                stream0_ssl_tokens, dtype=torch.long, device=device
+            )
+        # Position N_ssl = EOS step (ESPnet puts eos in gen_token_seq)
+        if N_ssl < T_full:
+            s0_full[N_ssl] = cfg.eos_token_id
+        # Remaining positions (flush steps) stay 0 (pad)
+
+        # Build full stream 1-8 column
         if H == 0:
-            s18 = torch.zeros(N, 8, dtype=torch.long, device=device)
+            s18_full = torch.zeros(T_full, 8, dtype=torch.long, device=device)
         else:
             s18_stack = torch.stack(history, dim=0)  # [H, 8]
-            if H >= N:
-                s18 = s18_stack[:N]
+            if H >= T_full:
+                s18_full = s18_stack[:T_full]
             else:
-                pad = torch.zeros(N - H, 8, dtype=torch.long, device=device)
-                s18 = torch.cat([s18_stack, pad], dim=0)
+                pad = torch.zeros(
+                    T_full - H, 8, dtype=torch.long, device=device
+                )
+                s18_full = torch.cat([s18_stack, pad], dim=0)
 
-        # Concatenate: [N, 9]
-        full_matrix = torch.cat([s0.unsqueeze(1), s18], dim=1)
-        full_matrix = full_matrix.unsqueeze(0)  # [1, N, 9]
+        # Full matrix: [T_full, 9]
+        full_matrix = torch.cat(
+            [s0_full.unsqueeze(1), s18_full], dim=1
+        ).unsqueeze(0)  # [1, T_full, 9]
 
-        # De-interleave: [1, N-8, 9]
+        # De-interleave on FULL sequence: [1, T_full - 8, 9]
         aligned = self._delay_deinterleave(full_matrix)
+
+        if aligned.shape[1] == 0:
+            return np.zeros(0, dtype=np.float32), self._dac_sample_rate
+
+        # Truncate to exclude the EOS frame (ESPnet: [:finish_idx - 1]).
+        # finish_idx in ESPnet = step after EOS was output as prev_tok.
+        # In our case, EOS is at step N_ssl in gen sequence.  After
+        # de-interleave, the EOS frame in stream 0 is at position N_ssl.
+        # We want [:N_ssl] to exclude EOS (same as ESPnet's [:finish_idx-1]
+        # where finish_idx = N_ssl + 1).
+        aligned = aligned[:, :N_ssl, :]
 
         if aligned.shape[1] == 0:
             return np.zeros(0, dtype=np.float32), self._dac_sample_rate

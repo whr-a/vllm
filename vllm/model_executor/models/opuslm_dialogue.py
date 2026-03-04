@@ -157,6 +157,11 @@ class _OpusLMDialogueAudioInputProcessor:
             None, ckpt_path, device=str(self.device)
         )
         self._ssl_model.eval()
+        # Disable masking so encode() produces deterministic features
+        # (matches ESPnet data prep which uses use_mask=False).
+        if hasattr(self._ssl_model, "util_attributes"):
+            self._ssl_model.util_attributes.discard("mask")
+            self._ssl_model.util_attributes.discard("block_mask")
         logger.info("Loaded XEUS SSL model on %s", self.device)
         self._kmeans_model = joblib.load(km_path)
         # Cache K-means centroids as GPU tensor for fast inference
@@ -1806,6 +1811,15 @@ class OpusLMDialogueForConditionalGeneration(
             stream0_logits[idx] = stream0_logits[idx].masked_fill(
                 self.text_mask_s0.unsqueeze(0), float("-inf")
             )
+            # ESPnet text_bpe minlen: block EOS until at least minlen tokens
+            for pos in text_positions:
+                req_cfg = self._get_req_config(pos)
+                text_step = int(req_cfg.get("text_step", 0))
+                text_minlen = int(
+                    req_cfg.get("text_minlen", getattr(cfg, "text_minlen", 1))
+                )
+                if text_step < max(text_minlen, 0):
+                    stream0_logits[pos, cfg.eos_token_id] = float("-inf")
 
         if audio_positions:
             idx = torch.tensor(audio_positions, device=dev, dtype=torch.long)
@@ -1820,6 +1834,25 @@ class OpusLMDialogueForConditionalGeneration(
                 )
                 if audio_step < max(audio_minlen, 0):
                     stream0_logits[pos, cfg.eos_token_id] = float("-inf")
+
+            # ESPnet applies top_k to ALL 9 streams including stream 0
+            # inside logits_to_tokens(). In vLLM, streams 1-8 get top_k in
+            # _sample_and_buffer_streams, but stream 0 goes to the standard
+            # vLLM sampler which uses request-level top_k (often unset/0).
+            # Apply audio_topk filtering to stream 0 here so the sampler
+            # only sees the top-k candidates.
+            for pos in audio_positions:
+                req_cfg = self._get_req_config(pos)
+                top_k = int(
+                    req_cfg.get("audio_topk", cfg.audio_topk)
+                )
+                if top_k > 0 and top_k < cfg.vocab_size:
+                    row = stream0_logits[pos]
+                    topk_vals, topk_idx = torch.topk(row, top_k)
+                    stream0_logits[pos] = torch.full_like(
+                        row, float("-inf")
+                    )
+                    stream0_logits[pos].scatter_(0, topk_idx, topk_vals)
 
         if pre_audio_positions:
             idx = torch.tensor(pre_audio_positions, device=dev, dtype=torch.long)

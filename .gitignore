@@ -282,7 +282,15 @@ tmp_tts_local_fix/
 tmp_tts_local_fix2/
 
 # OpusLM checkpoints
+opuslm_ckpt/
 opuslm_dialogue_ckpt/
+
+# OpusLM data and results
+data/
+results/
+
+# OpusLM clean scripts (dev)
+scripts_clear/
 
 # Test audio files
 test_*.wav
