@@ -2775,6 +2775,76 @@ class GPUModelRunner(
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
+
+            # OpusLM: sync batch request IDs and tokens_per_req EARLY
+            # so that embed_input_ids can correctly map token positions
+            # to requests in mixed prefill+decode batches.
+            _opuslm_fwd = getattr(self.model, 'runnable', self.model)
+            if (hasattr(_opuslm_fwd, '_stream18_history')
+                    and hasattr(_opuslm_fwd, '_current_batch_req_ids')):
+                _opu_num_early = self.input_batch.num_reqs
+                _opu_rids_early = list(
+                    self.input_batch.req_ids[:_opu_num_early])
+                _opuslm_fwd._current_batch_req_ids = _opu_rids_early
+                _opu_sched_early = scheduler_output.num_scheduled_tokens
+                _opuslm_fwd._tokens_per_req = [
+                    _opu_sched_early.get(r, 1) for r in _opu_rids_early
+                ]
+
+            # OpusLM: compute stream-history replay info for preempted
+            # audio requests being re-prefilled.  During original decode,
+            # each audio token's embedding = emb(s0)+emb(s1)+...+emb(s8).
+            # After preemption & re-prefill the generated audio tokens
+            # only get emb(s0)+8*emb(pad), corrupting KV cache.  We fix
+            # this by replaying the stored stream history at those positions.
+            if hasattr(_opuslm_fwd, '_stream18_history'):
+                _replay = {}  # abs_token_pos → stream history tensor [8]
+                _sched_toks = scheduler_output.num_scheduled_tokens
+                _tok_off = 0
+                _num_reqs = self.input_batch.num_reqs
+                for _ri in range(_num_reqs):
+                    _rid = self.input_batch.req_ids[_ri]
+                    _ntok = _sched_toks.get(_rid, 0)
+                    _hist = _opuslm_fwd._stream18_history.get(_rid)
+                    if _hist and _ntok > 1:
+                        # prefill with audio history → re-prefill
+                        _rs = self.requests.get(_rid)
+                        if _rs is not None:
+                            _plen = _rs.num_prompt_tokens
+                            _ncomp = int(
+                                self.input_batch.num_computed_tokens_cpu[_ri])
+                            _oids = list(_rs.output_token_ids)
+                            _marker = getattr(
+                                _opuslm_fwd.config,
+                                'codec_ssl_start_end_token_id', 34)
+                            _midx = -1
+                            for _oi, _tid in enumerate(_oids):
+                                if _tid == _marker:
+                                    _midx = _oi
+                                    break
+                            if _midx >= 0:
+                                # Pop last history entry — compute_logits
+                                # will re-sample it during re-prefill.
+                                # Without this pop, history grows by 1
+                                # (duplicate), corrupting DAC alignment.
+                                _hist.pop()
+                                _n_replay = 0
+                                for _hi, _he in enumerate(_hist):
+                                    # history[i] was sampled at step i,
+                                    # but used as stream buffer at step i+1.
+                                    # Step 0 has no buffer (skip history[last]
+                                    # since it would map beyond output).
+                                    _opos = _midx + 2 + _hi
+                                    _gpos = _plen + _opos
+                                    _lpos = _gpos - _ncomp
+                                    if 0 <= _lpos < _ntok:
+                                        _replay[_tok_off + _lpos] = _he
+                                        _n_replay += 1
+                    _tok_off += _ntok
+                _opuslm_fwd._prefill_stream_replay = _replay
+            else:
+                _opuslm_fwd = None  # flag: no OpusLM model
+
             inputs_embeds_scheduled = self.model.embed_input_ids(
                 self.input_ids.gpu[:num_scheduled_tokens],
                 multimodal_embeddings=mm_embeds,
@@ -3756,6 +3826,11 @@ class GPUModelRunner(
                 _opu_num = self.input_batch.num_reqs
                 _opu_rids = list(self.input_batch.req_ids[:_opu_num])
                 _opuslm_fwd._current_batch_req_ids = _opu_rids
+                # Pass per-request token counts for position mapping
+                _opu_sched = scheduler_output.num_scheduled_tokens
+                _opuslm_fwd._tokens_per_req = [
+                    _opu_sched.get(r, 1) for r in _opu_rids
+                ]
                 for _opu_rid in _opu_rids:
                     if _opu_rid not in self.requests:
                         continue

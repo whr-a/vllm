@@ -1220,6 +1220,7 @@ class OpusLMDialogueForConditionalGeneration(
         self._stream0_history: dict[str, list[int]] = {}
         self._decoded_audio: dict[str, str] = {}
         self._current_batch_req_ids: list[str] = []
+        self._prefill_stream_replay: dict[int, torch.Tensor] = {}
 
         # --- DAC decoder (lazy-loaded) ---
         self._dac_model = None
@@ -1642,10 +1643,30 @@ class OpusLMDialogueForConditionalGeneration(
         if self._stream_buffer_dict:
             stream_embed_positions = self._get_stream_embed_positions(input_ids)
             if stream_embed_positions.any():
-                inputs_embeds = self._apply_stream_embeddings(
+                inputs_embeds, applied_mask = self._apply_stream_embeddings(
                     input_ids, inputs_embeds, stream_embed_positions
                 )
-                has_real_streams |= stream_embed_positions
+                has_real_streams |= applied_mask
+
+        # ----- Re-prefill: replay stream history for preempted audio -----
+        # When a request in audio phase is preempted and re-prefilled,
+        # its generated audio tokens lose stream 1-8 embeddings (they
+        # only get emb(s0) instead of emb(s0)+...+emb(s8)).  We fix
+        # this by replaying the stored stream history at those positions.
+        replay_info = getattr(self, '_prefill_stream_replay', None)
+        if replay_info:
+            embed_fn = self.model.embed_tokens
+            for abs_pos, hist_entry in replay_info.items():
+                if abs_pos < inputs_embeds.shape[0]:
+                    stream_embeds = embed_fn(
+                        hist_entry.unsqueeze(0)
+                    )  # (1, 8, hidden)
+                    stream_sum = stream_embeds.sum(dim=1).squeeze(0)  # (H,)
+                    inputs_embeds[abs_pos] = (
+                        inputs_embeds[abs_pos] + stream_sum
+                    )
+                    has_real_streams[abs_pos] = True
+            self._prefill_stream_replay = {}
 
         # ----- Add pad bias to text positions -----
         # ESPnet: emb(x).sum(dim=nq) includes emb(pad=0) for inactive
@@ -1667,11 +1688,67 @@ class OpusLMDialogueForConditionalGeneration(
 
         return inputs_embeds
 
+    def _build_token_to_req_map(self) -> list[str] | None:
+        """Build token-level request ID list from _tokens_per_req.
+
+        In mixed prefill+decode batches, batch_rids has N_reqs entries
+        but input_ids has N_tokens entries. This expands request IDs
+        so that token_req_map[token_idx] gives the correct request ID.
+        """
+        batch_rids = self._current_batch_req_ids
+        tokens_per_req = getattr(self, '_tokens_per_req', None)
+        if not batch_rids or not tokens_per_req:
+            return None
+        if len(batch_rids) != len(tokens_per_req):
+            return None
+        token_req_map: list[str] = []
+        for rid, ntok in zip(batch_rids, tokens_per_req):
+            token_req_map.extend([rid] * ntok)
+        return token_req_map
+
     def _get_stream_embed_positions(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Return positions that should include buffered streams 1-8 embeddings."""
+        """Return positions that should include buffered streams 1-8 embeddings.
+
+        For decode steps (1 token per request), use phase-based detection.
+        For prefill/re-prefill (>1 token), use token-value detection to
+        avoid incorrectly marking text prompt tokens as audio positions.
+        """
         positions = torch.zeros_like(input_ids, dtype=torch.bool)
         batch_rids = self._current_batch_req_ids
-        if batch_rids:
+        tokens_per_req = getattr(self, '_tokens_per_req', None)
+        if batch_rids and tokens_per_req and len(batch_rids) == len(tokens_per_req):
+            cfg = self.config
+            tok_off = 0
+            for ri, (req_id, ntok) in enumerate(
+                zip(batch_rids, tokens_per_req)
+            ):
+                end = tok_off + ntok
+                if end > positions.numel():
+                    break
+                if req_id not in self._stream_buffer_dict:
+                    tok_off = end
+                    continue
+                rc = self._per_req_config.get(req_id, {})
+                phase = rc.get("phase", "text")
+                if phase not in ("audio", "audio_flush", "audio_stop"):
+                    tok_off = end
+                    continue
+                if ntok == 1:
+                    # Pure decode: mark the single token
+                    positions[tok_off] = True
+                else:
+                    # Prefill/re-prefill: only mark tokens in SSL range
+                    # (audio tokens), NOT text prompt tokens
+                    chunk = input_ids[tok_off:end]
+                    ssl_mask = (
+                        (chunk >= cfg.ssl_token_start)
+                        & (chunk < cfg.ssl_token_end)
+                    )
+                    positions[tok_off:end] = ssl_mask
+                tok_off = end
+            return positions
+        elif batch_rids:
+            # Fallback: pure decode, 1 token per request
             for pos, req_id in enumerate(batch_rids):
                 if pos >= positions.numel():
                     break
@@ -1694,27 +1771,49 @@ class OpusLMDialogueForConditionalGeneration(
         input_ids: torch.Tensor,
         inputs_embeds: torch.Tensor,
         is_audio: torch.Tensor,
-    ) -> torch.Tensor:
-        """Add streams 1-8 (DAC) embeddings for audio-mode positions."""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Add streams 1-8 (DAC) embeddings for audio-mode decode positions.
+
+        Only applies stream buffer to decode steps (1 token per request).
+        Prefill/re-prefill audio tokens are handled by stream replay.
+
+        Returns (inputs_embeds, applied_mask) where applied_mask indicates
+        which positions actually had stream embeddings applied.
+        """
+        applied_mask = torch.zeros_like(is_audio)
         audio_indices = is_audio.nonzero(as_tuple=True)[0]
         if len(audio_indices) == 0:
-            return inputs_embeds
+            return inputs_embeds, applied_mask
 
         embed_fn = self.model.embed_tokens
         batch_rids = self._current_batch_req_ids
+        tokens_per_req = getattr(self, '_tokens_per_req', None)
+
+        # Build set of token offsets that are decode positions (ntok==1)
+        decode_offsets: dict[int, str] = {}  # tok_offset → req_id
+        if batch_rids and tokens_per_req and len(batch_rids) == len(tokens_per_req):
+            tok_off = 0
+            for rid, ntok in zip(batch_rids, tokens_per_req):
+                if ntok == 1:
+                    decode_offsets[tok_off] = rid
+                tok_off += ntok
+        else:
+            # Fallback: assume pure decode (1 token per request)
+            for i, rid in enumerate(batch_rids):
+                decode_offsets[i] = rid
 
         buf_rows = []
         valid_positions = []
         for pos in audio_indices.tolist():
-            if pos < len(batch_rids):
-                req_id = batch_rids[pos]
+            if pos in decode_offsets:
+                req_id = decode_offsets[pos]
                 buf_vec = self._stream_buffer_dict.get(req_id)
                 if buf_vec is not None:
                     buf_rows.append(buf_vec)
                     valid_positions.append(pos)
 
         if not buf_rows:
-            return inputs_embeds
+            return inputs_embeds, applied_mask
 
         stream_tokens = torch.stack(buf_rows, dim=0)
         stream_embeds = embed_fn(stream_tokens)
@@ -1725,8 +1824,9 @@ class OpusLMDialogueForConditionalGeneration(
             valid_positions, device=inputs_embeds.device, dtype=torch.long
         )
         inputs_embeds[valid_idx] = inputs_embeds[valid_idx] + stream_sum
+        applied_mask[valid_idx] = True
 
-        return inputs_embeds
+        return inputs_embeds, applied_mask
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -2154,6 +2254,7 @@ class OpusLMDialogueForConditionalGeneration(
 
         dac_tokens = aligned[:, :, 1:]
         dac_cb = self._global_to_dac_codebook(dac_tokens)
+
         audio = self._dac_decode(dac_cb)
         return audio, self._dac_sample_rate
 

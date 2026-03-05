@@ -298,3 +298,9 @@ test_*.wav
 # Server scripts
 start_server.sh
 server_dialogue.log
+
+# Root-level test/debug scripts
+analyze_tokens.py
+test_ark_no_deinterleave.py
+test_dac_roundtrip.py
+test_pipeline_roundtrip.py

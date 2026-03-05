@@ -1179,6 +1179,9 @@ class Scheduler(SchedulerInterface):
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
+        logger.warning("PREEMPT req %s (preemption #%d, had %d output tokens)",
+                        request.request_id[:16], request.num_preemptions,
+                        request.num_output_tokens)
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
