@@ -1560,6 +1560,9 @@ class OpusLMForConditionalGeneration(
         # --- Dialogue mode flag (default False, overridden per-request) ---
         self._is_dialogue = False
 
+        # --- Cached pad bias (computed once after weight loading) ---
+        self._pad_bias: torch.Tensor | None = None
+
         # --- Precompute token masks ---
         self._build_masks(config)
 
@@ -1904,11 +1907,12 @@ class OpusLMForConditionalGeneration(
         needs_bias = ~handled
         if needs_bias.any():
             nq_minus_1 = int(getattr(self.config, "nq", 9)) - 1  # 8
-            pad_bias = self.model.embed_tokens(
-                torch.zeros(1, dtype=torch.long, device=input_ids.device)
-            )  # [1, H]
+            if self._pad_bias is None:
+                self._pad_bias = nq_minus_1 * self.model.embed_tokens(
+                    torch.zeros(1, dtype=torch.long, device=input_ids.device)
+                )  # [1, H], cached
             inputs_embeds = inputs_embeds.clone()
-            inputs_embeds[needs_bias] += nq_minus_1 * pad_bias
+            inputs_embeds[needs_bias] += self._pad_bias
 
         return inputs_embeds
 
@@ -2025,33 +2029,24 @@ class OpusLMForConditionalGeneration(
           "audio_stop" → force EOS (5) to stop the request
         """
         cfg = self.config
+        N = hidden_states.shape[0]
+        dev = hidden_states.device
 
-        # 1. Apply stream-0 head_emb bias (index 0) to get stream-0 logits
-        h0 = hidden_states + self.head_emb.weight[0].unsqueeze(0)
-        stream0_logits = self.logits_processor(self.lm_head, h0)
-        if stream0_logits is None:
-            return None
-
-        # 2. Determine per-position phase from _per_req_config
+        # 1. Determine per-position phase from _per_req_config
         batch_rids = self._current_batch_req_ids
-        N = stream0_logits.shape[0]
 
-        phases = []  # one per logit row
-        for i in range(N):
-            if i < len(batch_rids):
-                rc = self._per_req_config.get(batch_rids[i], {})
-                phases.append(rc.get("phase", "text"))
-            else:
-                phases.append("text")
-
-        # 3. Collect position indices per phase
         text_positions = []
         pre_audio_positions = []
         audio_positions = []
         audio_flush_positions = []
         audio_stop_positions = []
 
-        for i, ph in enumerate(phases):
+        for i in range(N):
+            if i < len(batch_rids):
+                rc = self._per_req_config.get(batch_rids[i], {})
+                ph = rc.get("phase", "text")
+            else:
+                ph = "text"
             if ph == "text":
                 text_positions.append(i)
             elif ph == "pre_audio":
@@ -2065,9 +2060,54 @@ class OpusLMForConditionalGeneration(
             else:
                 text_positions.append(i)
 
-        dev = stream0_logits.device
+        # 2. Single batched lm_head matmul for ALL streams.
+        # Stream 0 needs logits for all N positions.
+        # Streams 1-8 need logits only for audio+flush positions.
+        # We batch them all into one matmul to read the weight matrix once.
+        sample_positions = audio_positions + audio_flush_positions
+        num_sample = len(sample_positions)
+        num_extra_streams = cfg.nq - 1  # 8
 
-        # 4. Apply phase masks
+        # Build biased hidden states: [N + num_sample*8, H]
+        h0 = hidden_states + self.head_emb.weight[0].unsqueeze(0)  # [N, H]
+
+        if num_sample > 0:
+            sample_idx = torch.tensor(
+                sample_positions, device=dev, dtype=torch.long
+            )
+            audio_hidden = hidden_states[sample_idx]  # [num_sample, H]
+            # [num_sample, 8, H]
+            all_stream_biased = (
+                audio_hidden.unsqueeze(1)
+                + self.head_emb.weight[1:cfg.nq].unsqueeze(0)
+            )
+            # [num_sample*8, H]
+            all_stream_flat = all_stream_biased.reshape(
+                -1, hidden_states.shape[-1]
+            )
+            # Combined: [N + num_sample*8, H]
+            combined_h = torch.cat([h0, all_stream_flat], dim=0)
+        else:
+            combined_h = h0
+
+        # Single matmul for everything
+        combined_logits = self.logits_processor(self.lm_head, combined_h)
+        if combined_logits is None:
+            return None
+
+        V = combined_logits.shape[-1]
+        stream0_logits = combined_logits[:N]  # [N, V]
+
+        # Extract per-stream logits for audio positions
+        if num_sample > 0:
+            extra_logits = combined_logits[N:]  # [num_sample*8, V]
+            all_stream_logits = extra_logits.reshape(
+                num_sample, num_extra_streams, V
+            )  # [num_sample, 8, V]
+        else:
+            all_stream_logits = None
+
+        # 3. Apply phase masks to stream 0
         if text_positions:
             idx = torch.tensor(text_positions, device=dev, dtype=torch.long)
             stream0_logits[idx] = stream0_logits[idx].masked_fill(
@@ -2079,62 +2119,68 @@ class OpusLMForConditionalGeneration(
             stream0_logits[idx] = stream0_logits[idx].masked_fill(
                 self.audio_mask_s0.unsqueeze(0), float("-inf")
             )
-            # Match ARDelay allow_eos=step >= minlen behavior for stream 0.
+
+            # Vectorized minlen: suppress EOS for audio rows where step < minlen
+            default_minlen = max(int(getattr(cfg, "audio_minlen", 50)), 0)
+            eos_suppress_indices = []
             for pos in audio_positions:
                 req_cfg = self._get_req_config(pos)
                 audio_step = int(req_cfg.get("audio_step", 0))
-                audio_minlen = int(
-                    req_cfg.get("audio_minlen", getattr(cfg, "audio_minlen", 50))
-                )
+                audio_minlen = int(req_cfg.get("audio_minlen", default_minlen))
                 if audio_step < max(audio_minlen, 0):
-                    stream0_logits[pos, cfg.eos_token_id] = float("-inf")
+                    eos_suppress_indices.append(pos)
+            if eos_suppress_indices:
+                eos_idx = torch.tensor(
+                    eos_suppress_indices, device=dev, dtype=torch.long
+                )
+                stream0_logits[eos_idx, cfg.eos_token_id] = float("-inf")
 
-            # ESPnet applies top_k to ALL 9 streams including stream 0
-            # inside logits_to_tokens(). In vLLM, streams 1-8 get top_k in
-            # _sample_and_buffer_streams, but stream 0 goes to the standard
-            # vLLM sampler which uses request-level top_k (often unset/0).
-            # Apply audio_topk filtering to stream 0 here so the sampler
-            # only sees the top-k candidates.  Temperature is NOT applied
-            # here — it comes from the request-level SamplingParams.
+            # Batched top_k filtering for stream 0 audio positions.
+            topk_groups: dict[int, list[int]] = {}
             for pos in audio_positions:
                 req_cfg = self._get_req_config(pos)
-                top_k = int(
-                    req_cfg.get("audio_topk", cfg.audio_topk)
-                )
+                top_k = int(req_cfg.get("audio_topk", cfg.audio_topk))
                 if top_k > 0 and top_k < cfg.vocab_size:
-                    row = stream0_logits[pos]
-                    topk_vals, topk_idx = torch.topk(row, top_k)
-                    stream0_logits[pos] = torch.full_like(
-                        row, float("-inf")
-                    )
-                    stream0_logits[pos].scatter_(0, topk_idx, topk_vals)
+                    topk_groups.setdefault(top_k, []).append(pos)
+            for top_k, positions_list in topk_groups.items():
+                tk_idx = torch.tensor(
+                    positions_list, device=dev, dtype=torch.long
+                )
+                rows = stream0_logits[tk_idx]  # [K, V]
+                topk_vals, topk_indices = torch.topk(rows, top_k, dim=-1)
+                rows_new = torch.full_like(rows, float("-inf"))
+                rows_new.scatter_(1, topk_indices, topk_vals)
+                stream0_logits[tk_idx] = rows_new
 
         if pre_audio_positions:
-            # Force codec_ssl_start_end (34) output
-            idx = torch.tensor(pre_audio_positions, device=dev, dtype=torch.long)
+            idx = torch.tensor(
+                pre_audio_positions, device=dev, dtype=torch.long
+            )
             stream0_logits[idx] = float("-inf")
             stream0_logits[idx, cfg.codec_ssl_start_end_token_id] = 0.0
 
         if audio_flush_positions:
-            # Force pad (0) output during delay flush.
-            idx = torch.tensor(audio_flush_positions, device=dev, dtype=torch.long)
+            idx = torch.tensor(
+                audio_flush_positions, device=dev, dtype=torch.long
+            )
             stream0_logits[idx] = float("-inf")
             stream0_logits[idx, 0] = 0.0  # pad token
 
         if audio_stop_positions:
-            # Force EOS output to stop the request
-            idx = torch.tensor(audio_stop_positions, device=dev, dtype=torch.long)
+            idx = torch.tensor(
+                audio_stop_positions, device=dev, dtype=torch.long
+            )
             stream0_logits[idx] = float("-inf")
             stream0_logits[idx, cfg.eos_token_id] = 0.0
 
-        # 5. For audio-phase and flush-phase requests:
-        # sample DAC streams 1-8 and update per-request buffer.
-        sample_positions = audio_positions + audio_flush_positions
-        if sample_positions:
+        # 4. For audio-phase and flush-phase requests:
+        # sample DAC streams 1-8 using pre-computed logits.
+        if num_sample > 0 and all_stream_logits is not None:
             self._sample_and_buffer_streams(
                 hidden_states,
                 sampled_positions=sample_positions,
                 device=dev,
+                precomputed_stream_logits=all_stream_logits,
             )
 
         return stream0_logits
@@ -2144,81 +2190,99 @@ class OpusLMForConditionalGeneration(
         hidden_states: torch.Tensor,
         sampled_positions: list[int],
         device: torch.device,
+        precomputed_stream_logits: torch.Tensor | None = None,
     ):
-        """Sample DAC streams 1-8 for audio/flush positions and update buffer."""
+        """Sample DAC streams 1-8 for audio/flush positions and update buffer.
+
+        Args:
+            precomputed_stream_logits: Optional [N_audio, 8, V] tensor of
+                pre-computed logits for streams 1-8. If provided, skips the
+                lm_head matmul (already done in compute_logits).
+        """
         cfg = self.config
         if not sampled_positions:
             return
-        audio_idx = torch.tensor(sampled_positions, device=device, dtype=torch.long)
-
-        audio_hidden = hidden_states[audio_idx]  # [N_audio, H]
-        num_audio = len(audio_idx)
+        num_audio = len(sampled_positions)
         batch_rids = self._current_batch_req_ids
 
-        row_phase = []
-        row_flush_step = []
-        row_audio_step = []
-        for pos in sampled_positions:
+        # Pre-compute per-row phase info as tensors for vectorized masking
+        row_audio_step = torch.zeros(num_audio, dtype=torch.long, device=device)
+        row_flush_step = torch.zeros(num_audio, dtype=torch.long, device=device)
+        row_is_audio = torch.zeros(num_audio, dtype=torch.bool, device=device)
+        row_is_flush = torch.zeros(num_audio, dtype=torch.bool, device=device)
+        for i, pos in enumerate(sampled_positions):
             if pos < len(batch_rids):
                 rc = self._per_req_config.get(batch_rids[pos], {})
             else:
                 rc = {}
-            row_phase.append(rc.get("phase", "audio"))
-            row_flush_step.append(int(rc.get("flush_step", 0)))
-            row_audio_step.append(int(rc.get("audio_step", 0)))
+            phase = rc.get("phase", "audio")
+            if phase == "audio":
+                row_is_audio[i] = True
+                row_audio_step[i] = int(rc.get("audio_step", 0))
+            elif phase == "audio_flush":
+                row_is_flush[i] = True
+                row_flush_step[i] = int(rc.get("flush_step", 0))
+
+        # Pre-compute sampling groups (batched by temperature/top_k)
+        sampling_groups = self._get_audio_sampling_groups(
+            sampled_positions, device
+        )
 
         new_buffer = torch.zeros(
             num_audio, cfg.num_codec_streams,
             dtype=torch.long, device=device
         )
 
-        for s in range(1, cfg.nq):  # streams 1-8
-            # Apply per-stream head_emb bias
-            head_bias = self.head_emb.weight[s].unsqueeze(0)
-            h_s = audio_hidden + head_bias  # [N_audio, H]
+        # Use pre-computed logits if available, otherwise compute here
+        if precomputed_stream_logits is not None:
+            all_logits = precomputed_stream_logits
+        else:
+            num_extra_streams = cfg.nq - 1
+            audio_idx = torch.tensor(
+                sampled_positions, device=device, dtype=torch.long
+            )
+            audio_hidden = hidden_states[audio_idx]
+            all_biased = (
+                audio_hidden.unsqueeze(1)
+                + self.head_emb.weight[1:cfg.nq].unsqueeze(0)
+            )
+            all_biased_flat = all_biased.reshape(-1, audio_hidden.shape[-1])
+            all_logits_flat = self.logits_processor(
+                self.lm_head, all_biased_flat
+            )
+            if all_logits_flat is None:
+                return
+            V = all_logits_flat.shape[-1]
+            all_logits = all_logits_flat.reshape(
+                num_audio, num_extra_streams, V
+            )
 
-            s_logits = self.logits_processor(self.lm_head, h_s)
-            if s_logits is None:
-                continue
+        for s in range(1, cfg.nq):  # streams 1-8
+            s_idx = s - 1
+            s_logits = all_logits[:, s_idx, :]  # [N_audio, V]
 
             # Apply stream-specific mask
             s_logits = s_logits.masked_fill(
                 self._audio_masks[s].unsqueeze(0), float("-inf")
             )
 
-            sampled = torch.zeros(num_audio, dtype=torch.long, device=device)
-            for row in range(num_audio):
-                # Delay warmup behavior (ARDelay):
-                # step=0 allows only stream0; stream s starts after step >= s.
-                if (
-                    row_phase[row] == "audio"
-                    and row_audio_step[row] < s
-                ):
-                    sampled[row] = 0
-                    continue
-                # Flush behavior matching ARDelay semantics:
-                # after finish, progressively force stream_n to pad when
-                # finish_step > n (stream0 handled by logits mask above).
-                if (
-                    row_phase[row] == "audio_flush"
-                    and row_flush_step[row] > s
-                ):
-                    sampled[row] = 0
-                    continue
-
-                req_cfg = self._get_req_config(sampled_positions[row])
-                temperature = float(
-                    req_cfg.get("audio_temperature", cfg.audio_temperature)
-                )
-                top_k = int(req_cfg.get("audio_topk", cfg.audio_topk))
-                if top_k <= 0:
-                    top_k = cfg.vocab_size
-                top_k = max(1, min(top_k, cfg.vocab_size))
-                sampled[row] = self._top_k_sample(
-                    s_logits[row:row + 1],
+            # Batched top-k sampling per group
+            sampled = torch.empty(num_audio, dtype=torch.long, device=device)
+            for temperature, top_k, row_indices in sampling_groups:
+                sampled[row_indices] = self._top_k_sample(
+                    s_logits[row_indices],
                     temperature=temperature,
                     top_k=top_k,
-                )[0]
+                )
+
+            # Vectorized delay warmup: force pad for audio rows where step < s
+            warmup_mask = row_is_audio & (row_audio_step < s)
+            sampled[warmup_mask] = 0
+
+            # Vectorized flush: force pad when flush_step > s
+            flush_mask = row_is_flush & (row_flush_step > s)
+            sampled[flush_mask] = 0
+
             new_buffer[:, s - 1] = sampled
 
         # Store buffer and history per-request
